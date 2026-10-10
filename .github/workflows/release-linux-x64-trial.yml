@@ -18,9 +18,10 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-    env:
-      PI_CODING_AGENT_DIR: ${{ runner.temp }}/pi-trial-agent
     steps:
+      - name: Isolate trial runtime state
+        run: echo "PI_CODING_AGENT_DIR=$RUNNER_TEMP/pi-trial-agent" >> "$GITHUB_ENV"
+
       - name: Checkout tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
