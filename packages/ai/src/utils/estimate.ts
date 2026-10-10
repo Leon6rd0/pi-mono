@@ -55,6 +55,8 @@ export function estimateMessageTokens(message: Message): number {
 	}
 	if (message.role === "user") return estimateTextAndImageContentTokens(message.content);
 	if (message.role === "toolResult") return estimateTextAndImageContentTokens(message.content);
+	// transformMessages excludes incomplete responses from provider replay.
+	if (message.stopReason === "aborted" || message.stopReason === "error") return 0;
 
 	for (const block of message.content) {
 		if (block.type === "text") {
@@ -76,15 +78,12 @@ function getLastAssistantUsageInfo(messages: readonly Message[]): { usage: Usage
 		const message = messages[i];
 		if (message.role === "assistant") {
 			const assistant = message as AssistantMessage;
+			// Omitted responses cannot supply usage or invalidate a later response's prefix.
+			if (assistant.stopReason === "aborted" || assistant.stopReason === "error") continue;
 			// A newer prefix message was inserted after this response (for example, a
 			// compaction summary), so its usage cannot describe the current prefix.
 			const usageAppliesToPrefix = assistant.timestamp >= latestPrefixTimestamp;
-			if (
-				usageAppliesToPrefix &&
-				assistant.stopReason !== "aborted" &&
-				assistant.stopReason !== "error" &&
-				calculateContextTokens(assistant.usage) > 0
-			) {
+			if (usageAppliesToPrefix && calculateContextTokens(assistant.usage) > 0) {
 				usageInfo = { usage: assistant.usage, index: i };
 			}
 		}

@@ -20,7 +20,7 @@ Pi has two summarization mechanisms:
 | Compaction | Context exceeds threshold, or `/compact` | Summarize old messages to free up context |
 | Branch summarization | `/tree` navigation | Preserve context when switching branches |
 
-Both use closely related structured formats and track file operations cumulatively. Summarization requests disable prompt-cache writes because these one-off prompts are unlikely to be reused.
+Both use structured formats and track file operations cumulatively. Compaction adds a task handoff: current user intent, permission boundaries, failure evidence, and the stopping point of the summarized history. Summarization requests disable prompt-cache writes because these one-off prompts are unlikely to be reused.
 
 ## Compaction
 
@@ -38,7 +38,7 @@ During a multi-turn agent run, Pi checks the canonical projected context after t
 
 A provider context-overflow error or an early final `stopReason: "length"` can select one compact-and-retry recovery attempt. Length responses with tool calls retain their synthetic failed tool results and follow the ordinary tool/queue scheduler rather than forcing the run to end.
 
-You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary.
+You can also trigger manually with `/compact [instructions]`, where optional instructions focus both the history summary and any split user-message-span summary.
 
 ### How It Works
 
@@ -233,35 +233,48 @@ See [`collectEntriesForBranchSummary()`](https://github.com/earendil-works/pi/bl
 
 ## Summary Format
 
-Both formats include Goal, Constraints & Preferences, Progress, Key Decisions, and Next Steps. Compaction summaries also include Critical Context. Branch summaries stop after Next Steps. Pi appends file lists to either format when relevant.
+Both formats include Goal, Constraints & Preferences, Progress, Key Decisions, and Next Steps. Compaction additionally includes Failed Attempts, Current Work, and Critical Context. Branch summaries stop after Next Steps. Pi appends file lists to either format when relevant.
+
+Compaction is a work handoff, not a project knowledge base. It preserves the latest applicable request **in the summarized history**, decisive user wording, explicit success criteria, user corrections, and still-applicable permission boundaries. It distinguishes observed results from plans and unverified claims. Failed attempts include their evidence and conditions so an unchanged approach is not repeated without reason.
+
+On repeated compactions, newer requests and corrections reconcile the previous checkpoint. Completed, cancelled, and superseded work does not remain active merely because it appeared in an earlier summary. Still-relevant constraints, verified facts, and failure evidence are preserved; irrelevant completed history is condensed.
+
+The summarizer does not see the later retained messages. Current Work therefore describes the stopping point of the summarized span, not an invented state at the end of the session. The checkpoint's model-facing wrapper identifies it as historical context, not a new user request or approval, and gives later messages precedence when resuming. It does not start a new agent run on its own.
 
 Compaction summaries use this format:
 
 ```markdown
 ## Goal
-[What the user is trying to accomplish]
+- [Latest applicable request in this history, with a short exact user quote]
+- [Explicit success criteria and other still-active user-requested goals]
 
 ## Constraints & Preferences
-- [Requirements mentioned by user]
+- [Still-applicable requirements, corrections, and exact permission boundaries]
 
 ## Progress
 ### Done
-- [x] [Completed tasks]
+- [x] [Relevant completed work and observed verification results]
 
 ### In Progress
-- [ ] [Current work]
+- [ ] [Requested work that remains unfinished]
 
 ### Blocked
-- [Issues, if any]
+- [Current blockers, or "(none)"]
 
 ## Key Decisions
-- **[Decision]**: [Rationale]
+- **[Decision]**: [Rationale and source of the decision]
+
+## Failed Attempts
+- [Approach, observed failure, conditions, and reason not to retry unchanged]
+
+## Current Work
+- [Exact stopping point: file/function/command, pending result, or missing verification]
 
 ## Next Steps
-1. [What should happen next]
+1. [Action supported by the latest applicable request; note required confirmation]
 
 ## Critical Context
-- [Data needed to continue]
+- [Verified facts, artifact pointers, repository/branch state, and unknowns needed to continue]
 
 <read-files>
 path/to/file1.ts
@@ -282,12 +295,23 @@ Before summarization, messages are serialized to text via [`serializeConversatio
 [Assistant thinking]: Internal reasoning
 [Assistant]: Response text
 [Assistant tool calls]: read(path="foo.ts"); edit(path="bar.ts", ...)
-[Tool result]: Output from tool
+[Tool result]: {"tool":"bash","isError":true}
+Output from tool
+[Bash execution]: {"command":"run-tests","exitCode":1,"cancelled":false,"truncated":false}
+Shell output
+[Extension message]: {"type":"status"}
+Extension content
+[Branch summary]: Earlier branch context
+[Previous compaction summary]: Earlier checkpoint
 ```
 
-This prevents the model from treating it as a conversation to continue.
+Pass original `AgentMessage[]` to the serializer, not `convertToLlm()` output. Provider conversion relabels shell executions, extension messages, and summaries as user-shaped messages; serializing first preserves their provenance. Only actual user messages receive the `[User]` label. System messages and shell executions excluded with `!!` are omitted. Abnormal assistant outcomes are recorded separately as `[Assistant status]`.
 
-Tool results are truncated to 2000 characters during serialization. Content beyond that limit is replaced with a marker indicating how many characters were truncated. This keeps summarization requests within reasonable token budgets, since tool results (especially from `read` and `bash`) are typically the largest contributors to context size.
+Assistant responses with `stopReason: "aborted"` or `"error"` remain in raw session history for display and diagnostics, but `convertToLlm()` excludes them from normal model requests. Their unfinished text, thinking, and unexecuted tool calls are also excluded from default compaction and branch-summary serialization. The serializer retains only the stop status and an error diagnostic bounded to 2000 characters, plus a note that incomplete output was omitted. An interrupted response does not, by itself, cancel the user's task.
+
+These responses consume no estimated normal-context tokens and are not compaction cut points. Their tool calls do not add file-operation metadata because the agent loop never executes them. Earlier completed tool calls and separately recorded tool results, including nested calls from a cancelled script, are not discarded. Historical usage and billing records are unchanged: omitting a fragment from future context does not refund tokens already generated. Length-stopped responses keep the existing overflow/length recovery policy. Saved interrupted messages are filtered when context is rebuilt, but existing summary text is not rewritten; fragments already folded into an older summary cannot be automatically identified and removed.
+
+Tool and shell result text keeps up to 2000 characters: the first 1000 and last 1000, with an omission marker between them. This preserves trailing errors and test outcomes while bounding large output. Tool names and error flags, and shell commands, exit codes, cancellation flags, and full-output paths are retained separately. A failure flag survives even if the tool has no text result.
 
 ## Custom Summarization via Extensions
 
@@ -335,21 +359,21 @@ pi.on("session_before_compact", async (event, ctx) => {
 To generate a summary with your own model, convert messages to text using `serializeConversation`:
 
 ```typescript
-import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
+import { serializeConversation } from "@earendil-works/pi-coding-agent";
 
 pi.on("session_before_compact", async (event, ctx) => {
   const { preparation } = event;
   
-  // Convert AgentMessage[] to Message[], then serialize to text
-  const conversationText = serializeConversation(
-    convertToLlm(preparation.messagesToSummarize)
-  );
+  // Preserve original message roles while serializing to text.
+  const conversationText = serializeConversation(preparation.messagesToSummarize);
   // Returns:
   // [User]: message text
   // [Assistant thinking]: thinking content
   // [Assistant]: response text
   // [Assistant tool calls]: read(path="..."); bash(command="...")
-  // [Tool result]: output text
+  // [Tool result]: tool name, error flag, and bounded output
+  // [Bash execution]: command, outcome metadata, and bounded output
+  // [Extension message]: extension type and content
 
   // Now send to your model for summarization
   const { summary, usage } = await myModel.summarize(conversationText);

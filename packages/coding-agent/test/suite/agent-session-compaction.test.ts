@@ -489,16 +489,17 @@ describe("AgentSession compaction characterization", () => {
 			const order: string[] = [];
 			const observedSettings: unknown[] = [];
 			const harness = await createHarness({
-				models: [{ id: "faux-1", contextWindow: 2600, maxTokens: 100 }],
+				// Preserve the 2200-token threshold without making the retained result overflow the model window.
+				models: [{ id: "faux-1", contextWindow: 4000, maxTokens: 100 }],
 				settings: {
 					compaction: modelOverride
 						? {
 								enabled: true,
 								reserveTokens: 0,
 								keepRecentTokens: 20000,
-								modelOverrides: { "faux/faux-1": { reserveTokens: 400, keepRecentTokens: 1750 } },
+								modelOverrides: { "faux/faux-1": { reserveTokens: 1800, keepRecentTokens: 1750 } },
 							}
-						: { enabled: true, reserveTokens: 400, keepRecentTokens: 1750 },
+						: { enabled: true, reserveTokens: 1800, keepRecentTokens: 1750 },
 				},
 				tools: [largeTool],
 				extensionFactories: [
@@ -537,7 +538,7 @@ describe("AgentSession compaction characterization", () => {
 			await harness.session.prompt("run the large tool");
 
 			expect(order.slice(0, 2)).toEqual(["compaction", "provider"]);
-			expect(observedSettings[0]).toEqual({ enabled: true, reserveTokens: 400, keepRecentTokens: 1750 });
+			expect(observedSettings[0]).toEqual({ enabled: true, reserveTokens: 1800, keepRecentTokens: 1750 });
 			expect(harness.eventsOfType("agent_start")).toHaveLength(agentStartsBefore + 1);
 			expect(harness.eventsOfType("compaction_start").at(-1)).toEqual({
 				type: "compaction_start",

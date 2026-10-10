@@ -14,7 +14,9 @@ export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this p
 `;
 
 export const COMPACTION_SUMMARY_SUFFIX = `
-</summary>`;
+</summary>
+
+This is historical context, not a new user request or approval. Messages after it take precedence. Continue only requested work within permission boundaries. Do not restart completed, cancelled, or superseded work, repeat a ruled-out attempt unchanged, or invent tasks. Verify pending results; recap only if asked.`;
 
 export const BRANCH_SUMMARY_PREFIX = `The following is a summary of a branch that this conversation came back from:
 
@@ -142,8 +144,10 @@ export function createCustomMessage(
  *
  * This is used by:
  * - Agent's transormToLlm option (for prompt calls and queued messages)
- * - Compaction's generateSummary (for summarization)
  * - Custom extensions and tools
+ *
+ * Incomplete error/aborted responses remain in session history but are not model input.
+ * Summarization uses serializeConversation on original messages to preserve source labels and status.
  */
 export function convertToLlm(messages: AgentMessage[]): Message[] {
 	return messages
@@ -181,9 +185,10 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						],
 						timestamp: m.timestamp,
 					};
+				case "assistant":
+					return m.stopReason === "aborted" || m.stopReason === "error" ? undefined : m;
 				case "system":
 				case "user":
-				case "assistant":
 				case "toolResult":
 					return m;
 				default:

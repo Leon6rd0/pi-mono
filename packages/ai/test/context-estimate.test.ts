@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildBaseOptions } from "../src/api/simple-options.ts";
 import type { AssistantMessage, Model, Usage } from "../src/types.ts";
-import { estimateContextTokens } from "../src/utils/estimate.ts";
+import { estimateContextTokens, estimateMessageTokens } from "../src/utils/estimate.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 function createUsage(totalTokens: number): Usage {
@@ -42,6 +42,44 @@ const model: Model<"openai-responses"> = {
 };
 
 describe("context token estimation", () => {
+	it.each(["aborted", "error"] as const)("does not reserve output capacity for %s fragments", (stopReason) => {
+		const interrupted: AssistantMessage = {
+			...createAssistant(300, 9_000),
+			stopReason,
+			content: [
+				{ type: "text", text: "unfinished answer".repeat(1000) },
+				{ type: "thinking", thinking: "unfinished thinking".repeat(1000) },
+				{ type: "toolCall", id: "partial-call", name: "write", arguments: { content: "x".repeat(10_000) } },
+			],
+		};
+		const messages = [
+			createAssistant(100, 2_000),
+			{ role: "user" as const, content: "inspect only", timestamp: 200 },
+		];
+		const context = normalizeContext({ messages: [...messages, interrupted] });
+		const cleanContext = normalizeContext({ messages });
+
+		expect(estimateMessageTokens(interrupted)).toBe(0);
+		expect(estimateContextTokens(context)).toEqual(estimateContextTokens(cleanContext));
+		expect(buildBaseOptions(model, context).maxTokens).toBe(buildBaseOptions(model, cleanContext).maxTokens);
+		expect(estimateContextTokens([messages[1], interrupted])).toEqual(estimateContextTokens([messages[1]]));
+	});
+
+	it.each(["aborted", "error"] as const)("does not let omitted %s timestamps invalidate usage", (stopReason) => {
+		const interrupted = { ...createAssistant(500, 9_000), stopReason };
+		const estimate = estimateContextTokens([
+			{ role: "user", content: "request", timestamp: 200 },
+			interrupted,
+			createAssistant(300, 2_000),
+		]);
+		expect(estimate).toEqual({ tokens: 2_000, usageTokens: 2_000, trailingTokens: 0, lastUsageIndex: 2 });
+	});
+
+	it("still counts length-limited output under the existing recovery policy", () => {
+		const message = { ...createAssistant(100, 0), stopReason: "length" as const };
+		expect(estimateMessageTokens(message)).toBeGreaterThan(0);
+	});
+
 	// Regression for #10497: large new inputs need more room than chars/4 allows.
 	it("reserves 3.5 characters per token for new text when limiting output", () => {
 		const context = normalizeContext({

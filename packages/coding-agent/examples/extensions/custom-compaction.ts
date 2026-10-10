@@ -15,7 +15,7 @@
 
 import { uuidv7 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
+import { serializeConversation } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_before_compact", async (event, ctx) => {
@@ -39,8 +39,8 @@ export default function (pi: ExtensionAPI) {
 			"info",
 		);
 
-		// Convert messages to readable text format
-		const conversationText = serializeConversation(convertToLlm(allMessages));
+		// Preserve original roles so shell output and extensions are not mistaken for user requests.
+		const conversationText = serializeConversation(allMessages);
 
 		// Include previous summary context if available
 		const previousContext = previousSummary ? `\n\nPrevious session summary for context:\n${previousSummary}` : "";
