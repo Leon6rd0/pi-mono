@@ -206,6 +206,46 @@ The built-in MCP support connects registered servers. When nothing does, because
 <a id="extensioncommandcontext"></a>
 <a id="use-extension-context"></a>
 
+### Command thinking presets
+
+A registered command may provide optional `thinkingPreset` metadata to expose a
+session-only action in the interactive `/thinking` picker and its argument completion:
+
+```typescript
+let myModeEnabled = false;
+pi.registerCommand("my-mode", {
+  description: "Select extra-high reasoning with my session mode",
+  thinkingPreset: {
+    value: "xhigh+my-mode",
+    label: "xhigh + My mode",
+    thinkingLevel: "xhigh",
+    isAvailable: (ctx) => !!ctx.model && ctx.model.api !== "pi-virtual",
+    isActive: () => myModeEnabled && pi.getThinkingLevel() === "xhigh",
+  },
+  handler: async (_args, ctx) => {
+    pi.setThinkingLevel("xhigh");
+    myModeEnabled = true;
+    ctx.ui.notify("Mode enabled for this session", "info");
+  },
+});
+```
+
+`myModeEnabled` is extension-owned state; persist and reconstruct it from custom
+session entries if it must survive reload. `thinkingLevel` is optional for mode-only
+actions. If supplied, the preset is shown only when that level is supported by the
+current model. `isAvailable` and `isActive` are synchronous context callbacks; a
+throwing callback hides that preset without breaking ordinary thinking choices.
+Values must match `^[a-z][a-z0-9+_-]*$` and must not collide with ordinary level
+values or earlier presets. Selection executes the resolved extension command; the
+handler owns the actual changes. Recheck availability in the handler since direct
+commands and changing runtime state can bypass a stale picker.
+
+A preset value is **not** a `ThinkingLevel`, cannot be saved as a provider default,
+and is not a new API reasoning parameter. The command itself also works from
+non-interactive modes, without the picker. See the independent
+[Workflow example](../examples/extensions/workflow/README.md) for separate thinking
+and branch-scoped orchestration consent.
+
 ### Context and session changes
 
 `ExtensionContext` provides the working directory, mode, UI, session manager, model runtime, abort signal, context usage, and controls for compaction and shutdown.

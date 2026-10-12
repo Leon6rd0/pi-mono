@@ -117,6 +117,7 @@ import type { FullscreenExitOutput, TuiMode } from "../../core/settings-manager.
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
+import { getThinkingPresets, type ThinkingPresetChoice } from "../../core/thinking-presets.ts";
 import { withBuiltInRenderers } from "../../core/tools/renderers/index.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
@@ -759,14 +760,15 @@ export class InteractiveMode {
 		const thinkingCommand = slashCommands.find((command) => command.name === "thinking");
 		if (thinkingCommand) {
 			thinkingCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null => {
+				const items = [
+					...this.session.getAvailableThinkingLevels().map((level) => ({ value: level, label: level })),
+					...this.getThinkingPresets(),
+				];
 				return createFuzzyAutocompleteItems(
-					this.session.getAvailableThinkingLevels(),
+					items,
 					prefix,
-					(level) => level,
-					(level) => ({
-						value: level,
-						label: level,
-					}),
+					(item) => `${item.value} ${item.label}`,
+					(item) => ({ value: item.value, label: item.label }),
 				);
 			};
 		}
@@ -3221,7 +3223,7 @@ export class InteractiveMode {
 			if (text === "/thinking" || text.startsWith("/thinking ")) {
 				const searchTerm = text.startsWith("/thinking ") ? text.slice(10).trim() : undefined;
 				this.editor.setText("");
-				this.handleThinkingCommand(searchTerm);
+				await this.handleThinkingCommand(searchTerm);
 				return;
 			}
 			if (text === "/export" || text.startsWith("/export ")) {
@@ -5142,17 +5144,39 @@ export class InteractiveMode {
 		});
 	}
 
-	private handleThinkingCommand(searchTerm?: string): void {
+	private getThinkingPresets(): ThinkingPresetChoice[] {
+		const runner = this.session.extensionRunner;
+		return getThinkingPresets(
+			runner.getRegisteredCommands(),
+			this.session.getAvailableThinkingLevels(),
+			runner.createContext(),
+		);
+	}
+
+	private async handleThinkingCommand(searchTerm?: string): Promise<void> {
 		const availableLevels = this.session.getAvailableThinkingLevels();
 		if (!searchTerm) {
 			this.showThinkingSelector();
 			return;
 		}
 
-		const normalized = searchTerm.trim().toLowerCase();
+		const normalized = searchTerm.trim().toLowerCase().replace(/\s+/g, "");
+		const presets = this.getThinkingPresets();
+		const preset = presets.find((candidate) => candidate.value === normalized);
+		if (preset) {
+			try {
+				await this.session.prompt(preset.command);
+				this.footer.invalidate();
+				this.updateEditorBorderColor();
+			} catch (error) {
+				this.showError(error instanceof Error ? error.message : String(error));
+			}
+			return;
+		}
 		const level = availableLevels.find((candidate) => candidate.toLowerCase() === normalized);
 		if (!level) {
-			this.showError(`Unknown thinking level "${searchTerm}". Available levels: ${availableLevels.join(", ")}.`);
+			const choices = [...availableLevels, ...presets.map((preset) => preset.value)];
+			this.showError(`Unknown thinking level or preset "${searchTerm}". Available choices: ${choices.join(", ")}.`);
 			return;
 		}
 
@@ -5186,6 +5210,14 @@ export class InteractiveMode {
 				},
 				(level) => selectLevel(level, true),
 				this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
+				{
+					items: this.getThinkingPresets(),
+					onSelect: (value) => {
+						done();
+						void this.handleThinkingCommand(value);
+					},
+					onSaveUnsupported: () => this.showStatus("Mode presets are session-only; press Enter to apply"),
+				},
 			);
 			return { component: selector, focus: selector };
 		});

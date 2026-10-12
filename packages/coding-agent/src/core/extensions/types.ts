@@ -1542,6 +1542,16 @@ export interface RegisteredCommand {
 	name: string;
 	sourceInfo: SourceInfo;
 	description?: string;
+	/** Offer this command as a session-only /thinking preset, separate from provider reasoning levels. */
+	thinkingPreset?: {
+		/** Unique /thinking argument, for example "xhigh+workflow". */
+		value: string;
+		label: string;
+		/** Omit for a mode-only action that leaves thinking unchanged. */
+		thinkingLevel?: ThinkingLevel;
+		isAvailable?: (ctx: ExtensionContext) => boolean;
+		isActive?: (ctx: ExtensionContext) => boolean;
+	};
 	getArgumentCompletions?: (argumentPrefix: string) => AutocompleteItem[] | null | Promise<AutocompleteItem[] | null>;
 	handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
 }

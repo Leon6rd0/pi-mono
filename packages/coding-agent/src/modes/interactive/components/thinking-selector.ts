@@ -11,6 +11,7 @@ import {
 	Spacer,
 	Text,
 } from "@earendil-works/pi-tui";
+import type { ThinkingPresetChoice } from "../../../core/thinking-presets.ts";
 import { getSelectListTheme, theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyDisplayText } from "./keybinding-hints.ts";
@@ -41,6 +42,12 @@ export class ThinkingSelectorComponent extends Container implements Focusable {
 	private onSelect: (level: ThinkingLevel) => void;
 	private onCancel: () => void;
 	private onSelectAsDefault?: (level: ThinkingLevel) => void;
+	private readonly availableLevels: readonly ThinkingLevel[];
+	private readonly presets?: {
+		items: readonly ThinkingPresetChoice[];
+		onSelect: (value: string) => void;
+		onSaveUnsupported?: () => void;
+	};
 	private _focused = false;
 
 	get focused(): boolean {
@@ -59,18 +66,29 @@ export class ThinkingSelectorComponent extends Container implements Focusable {
 		onCancel: () => void,
 		onSelectAsDefault?: (level: ThinkingLevel) => void,
 		defaultThinkingLevel?: ThinkingLevel,
+		presets?: ThinkingSelectorComponent["presets"],
 	) {
 		super();
 		this.onSelect = onSelect;
 		this.onCancel = onCancel;
 		this.onSelectAsDefault = onSelectAsDefault;
+		this.availableLevels = availableLevels;
+		this.presets = presets;
+		const activePreset = presets?.items.find((preset) => preset.active);
 
-		this.allItems = availableLevels.map((level) => ({
-			value: level,
-			label: `${level === currentLevel ? "✓ " : "  "}${level}`,
-			description:
-				level === defaultThinkingLevel ? `${LEVEL_DESCRIPTIONS[level]} · default` : LEVEL_DESCRIPTIONS[level],
-		}));
+		this.allItems = [
+			...availableLevels.map((level) => ({
+				value: level,
+				label: `${level === currentLevel && !activePreset ? "✓ " : "  "}${level}`,
+				description:
+					level === defaultThinkingLevel ? `${LEVEL_DESCRIPTIONS[level]} · default` : LEVEL_DESCRIPTIONS[level],
+			})),
+			...(presets?.items.map((preset) => ({
+				value: preset.value,
+				label: `${preset.active ? "✓ " : "  "}${preset.label}`,
+				description: `${preset.description ?? "Extension mode"} · session only`,
+			})) ?? []),
+		];
 
 		// Add top border
 		this.addChild(new DynamicBorder());
@@ -86,7 +104,7 @@ export class ThinkingSelectorComponent extends Container implements Focusable {
 		this.addChild(new Spacer(1));
 
 		// Create selector
-		this.selectList = this.buildSelectList(this.allItems, currentLevel);
+		this.selectList = this.buildSelectList(this.allItems, activePreset?.value ?? currentLevel);
 		this.selectListChildIndex = this.children.length;
 		this.addChild(this.selectList);
 		this.addChild(new Spacer(1));
@@ -105,13 +123,17 @@ export class ThinkingSelectorComponent extends Container implements Focusable {
 		this.addChild(new DynamicBorder());
 	}
 
-	private buildSelectList(items: SelectItem[], preselect?: ThinkingLevel): SelectList {
+	private buildSelectList(items: SelectItem[], preselect?: string): SelectList {
 		const list = new SelectList(items, Math.max(1, items.length), getSelectListTheme(), THINKING_SELECT_LIST_LAYOUT);
 		const currentIndex = items.findIndex((item) => item.value === preselect);
 		if (currentIndex !== -1) {
 			list.setSelectedIndex(currentIndex);
 		}
-		list.onSelect = (item) => this.onSelect(item.value as ThinkingLevel);
+		list.onSelect = (item) => {
+			const level = this.availableLevels.find((level) => level === item.value);
+			if (level) this.onSelect(level);
+			else this.presets?.onSelect(item.value);
+		};
 		list.onCancel = () => this.onCancel();
 		return list;
 	}
@@ -120,7 +142,7 @@ export class ThinkingSelectorComponent extends Container implements Focusable {
 		const filtered = query
 			? fuzzyFilter(this.allItems, query, (item) => `${item.value} ${item.description ?? ""}`)
 			: this.allItems;
-		const selectedValue = this.selectList.getSelectedItem()?.value as ThinkingLevel | undefined;
+		const selectedValue = this.selectList.getSelectedItem()?.value;
 		const newList = this.buildSelectList(filtered, selectedValue);
 		this.children[this.selectListChildIndex] = newList;
 		this.selectList = newList;
@@ -130,7 +152,9 @@ export class ThinkingSelectorComponent extends Container implements Focusable {
 		const kb = getKeybindings();
 		if (kb.matches(keyData, "app.thinking.save") && this.onSelectAsDefault) {
 			const item = this.selectList.getSelectedItem();
-			if (item) this.onSelectAsDefault(item.value as ThinkingLevel);
+			const level = this.availableLevels.find((level) => level === item?.value);
+			if (level) this.onSelectAsDefault(level);
+			else if (item) this.presets?.onSaveUnsupported?.();
 			return;
 		}
 
