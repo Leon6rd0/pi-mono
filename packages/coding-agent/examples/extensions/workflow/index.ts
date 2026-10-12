@@ -10,6 +10,7 @@ import {
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { Check } from "typebox/value";
+import { allowWorkflowNotification, registerWorkflowActivity } from "../task-monitor/activity.ts";
 import { safeText } from "../task-monitor/manager.ts";
 import { createChildRunner } from "./child-agent.ts";
 import { WorkflowManager } from "./manager.ts";
@@ -137,6 +138,7 @@ export function createWorkflowExtension(options: WorkflowOptions = {}): Extensio
 		const runScript = options.runScript ?? createScriptRunner(pi);
 		const mode = registerWorkflowMode(pi, options.modeEnabled);
 		let manager: WorkflowManager | undefined;
+		registerWorkflowActivity(pi, () => manager?.list(true) ?? []);
 		let context: ExtensionContext | undefined;
 		let notifyModel = options.notifyModel ?? true;
 		let pausedAfterAbort = false;
@@ -184,7 +186,14 @@ export function createWorkflowExtension(options: WorkflowOptions = {}): Extensio
 				lines.join("\n"),
 				records.some((record) => record.outcome === "failed") ? "warning" : "info",
 			);
-			const mayContinue = notifyModel && !pausedAfterAbort && context.hasUI;
+			const mayContinue =
+				notifyModel &&
+				!pausedAfterAbort &&
+				context.hasUI &&
+				allowWorkflowNotification(
+					pi,
+					records.map((record) => record.id),
+				);
 			pi.sendMessage(
 				{
 					customType: "workflow-event",

@@ -1,12 +1,16 @@
 # Tasks, background jobs, and Monitor
 
 This extension adds three model tools and a live task panel without replacing Pi's
-Bash tool, provider, or compaction logic. It works with the fork's Pi 1.1.0 trial
-binary through the normal extension loader; no binary rebuild is required.
+Bash tool, provider, or compaction logic. It uses the normal extension loader.
+Bounded task continuation requires the fork's actionable `agent_before_settle`
+boundary; validate the installed host separately from source tests. Updating
+extension files alone is not proof that a running session has reloaded them.
 
 ## Behavior
 
-- `tasks`: create/list/get/update/acknowledge logical tasks with dependencies.
+- `tasks`: create/list/get/update/acknowledge logical tasks with dependencies,
+  durable checkpoints, and explicitly enabled bounded continuation. `runtime`
+  reports the loaded feature identity (`task-continuity-v1`) and adapter readiness.
   Default lists track active and unprocessed work, not all historical records.
 - `background`: start/list/status/stop shell jobs. Starting returns a job ID,
   rather than keeping a tool call open until the command finishes.
@@ -31,8 +35,11 @@ pi --extension /absolute/path/to/task-monitor/index.ts
 ```
 
 Or add that entry path to `extensions` in the agent-directory `settings.json` and
-run `/reload`. Keep the directory's `index.ts` and `manager.ts` together. This is
-an explicitly installed extension, not a new stock built-in tool.
+run `/reload`. Keep `index.ts`, `manager.ts`, `continuation.ts`, and `activity.ts`
+together. This is an explicitly installed extension, not a new stock built-in tool.
+If Workflow is installed, its matching activity/notification adapter must also be
+present. An unavailable or ambiguous activity adapter blocks continuation rather
+than guessing that no Workflow executor exists.
 
 The optional `<agent-dir>/task-monitor.json` config is user-level only:
 
@@ -52,6 +59,71 @@ absolute `cwd`, even if Pi was started in the home directory.
 `allowedCwdRoots` checks the canonical **starting directory**. It is not a
 filesystem or network sandbox: a shell can still `cd` elsewhere or access any
 resource allowed to the Pi OS user.
+
+## Durable checkpoints and bounded continuation
+
+Problem: `running` used to be only bookkeeping. After a successful build was
+processed, a model could say “next phase later” and settle with no executor or
+future event. A running label did not schedule that next phase; update summaries
+were also discarded. Neither changing models nor refreshing that label fixes the
+missing execution mechanism.
+
+`tasks.update` now persists `summary`, `phase`, `next_action` and `blocked_reason`
+without requiring a status change. `null` clears `next_action` or `blocked_reason`.
+For example, after creating a root task:
+
+```json
+{
+  "action": "update",
+  "id": "task-<root-uuid>",
+  "phase": "verify",
+  "summary": "Implementation complete; validation not yet run",
+  "next_action": { "key": "verify-1", "instruction": "Run the approved offline validation" },
+  "blocked_reason": null
+}
+```
+
+This is a checkpoint, **not opt-in**. Enable it with the user command
+`/tasks continue task-<root-uuid> [1-16]`, or `tasks` action `continue` with a fresh
+UI confirmation. No UI means tool-based activation is refused. Scope, next step,
+and limits are shown before confirmation. Mode ON, notify ON, model prose, task
+labels and child results never substitute for task-specific opt-in.
+
+Only one root can be armed. Defaults: 8 continuation/event prompt reservations,
+maximum 16, within 30 minutes. Accounting is saved before dispatch. Two repeated
+unchanged progress comparisons pause the plan; merely updating summary text does
+not reset this guard. These are **not token, billing or total model-request caps**:
+ordinary tool turns within a request cycle still occur, and Workflow retains its
+own separate budgets. Explicit renewal starts a new finite allowance.
+
+At a successful settle boundary, a ready plan requests its next scoped step.
+Live executors and unprocessed results suppress boundary continuation: wait for
+real completion events, read/process results, acknowledge, then continue. Owned
+completion prompts share the allowance and are deduplicated per executor, even
+across overlapping batches. Log matches cannot consume plan-continuation prompts.
+Other extensions' boundary entries and pending user messages retain priority.
+
+`parent_id` links subordinate logical tasks. New tasks/jobs automatically attach
+to the active root unless a task's parent is explicitly supplied. Nested leaves
+are supported; one linked job attempt owns its leaf, which cannot become a parent
+or be reused for another attempt. Parent completion requires processed descendants;
+active Workflow activity also blocks completion. Workflow IDs observed during the
+armed interval are recorded through a trusted metadata adapter, not inferred from
+child output. The session-wide Workflow activity gate is deliberately conservative.
+
+`/tasks pause`, new user input, branch changes, Escape/error, explicit job stop,
+and reload revoke future plan scheduling. They do not undo work or retract an
+already dispatched model request. Failed/stopped/unknown outcomes block automatic
+progress; they are not replayed. Reload retains checkpoint/counter evidence but
+requires a new explicit continuation command; notification toggles do not re-arm
+it. Existing `running` records migrate as bookkeeping, never as authorization.
+A plan paused while a job runs can need explicit result processing before renewal.
+
+The panel distinguishes `task:needs-continuation`, `task:waiting-job`, actual
+`job:running`, and plan ready/waiting/awaiting-processing/paused/blocked states.
+A checkpoint, an active executor, and a completed/accepted deliverable are different
+facts. This mechanism does not prove that a model's completion claim is correct,
+grant write access, or bypass normal tool approvals.
 
 ## Example workflow
 
@@ -109,6 +181,8 @@ User commands:
 ```text
 /tasks list
 /tasks history
+/tasks continue task-<root-uuid> 8
+/tasks pause
 /tasks logs job-<uuid>
 /tasks ack job-<uuid> Read exit status and handled the result
 /tasks stop job-<uuid>
@@ -199,7 +273,9 @@ From `packages/coding-agent`:
 
 ```sh
 node ../../node_modules/vitest/dist/cli.js --run \
-  test/task-monitor-manager.test.ts test/suite/task-monitor.test.ts
+  test/task-monitor-manager.test.ts test/suite/task-monitor.test.ts \
+  test/task-continuation.test.ts test/task-activity.test.ts \
+  test/suite/task-continuation.test.ts test/suite/agent-session-boundaries.test.ts
 ```
 
 Tests use the faux provider and local processes, never paid model APIs. Real TUI

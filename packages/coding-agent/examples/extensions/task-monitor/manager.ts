@@ -40,6 +40,16 @@ const recordSchema = Type.Object({
 	acknowledgedAt: Type.Optional(Type.Number()),
 	acknowledgement: Type.Optional(Type.String({ maxLength: 1000 })),
 	dependencies: Type.Array(Type.String(), { maxItems: 100 }),
+	parentTaskId: Type.Optional(Type.String()),
+	phase: Type.Optional(Type.String({ maxLength: 200 })),
+	summary: Type.Optional(Type.String({ maxLength: 1000 })),
+	nextAction: Type.Optional(
+		Type.Object({
+			key: Type.String({ minLength: 1, maxLength: 100 }),
+			instruction: Type.String({ minLength: 1, maxLength: 2000 }),
+		}),
+	),
+	blockedReason: Type.Optional(Type.String({ maxLength: 1000 })),
 	createdAt: Type.Number(),
 	updatedAt: Type.Number(),
 	command: Type.Optional(Type.String({ maxLength: 32768 })),
@@ -59,6 +69,11 @@ export interface TaskRecord {
 	acknowledgedAt?: number;
 	acknowledgement?: string;
 	dependencies: string[];
+	parentTaskId?: string;
+	phase?: string;
+	summary?: string;
+	nextAction?: { key: string; instruction: string };
+	blockedReason?: string;
 	createdAt: number;
 	updatedAt: number;
 	command?: string;
@@ -66,6 +81,13 @@ export interface TaskRecord {
 	taskId?: string;
 	exitCode?: number;
 	error?: string;
+}
+
+export interface TaskCheckpoint {
+	phase?: string;
+	summary?: string;
+	nextAction?: TaskRecord["nextAction"] | null;
+	blockedReason?: string | null;
 }
 
 export interface MonitorRecord {
@@ -216,20 +238,45 @@ export class TaskManager {
 		if (this.records.size >= 1000) throw new Error("Session task limit reached (1000)");
 	}
 
-	createTask(label: string, dependencies: string[] = []): TaskRecord {
+	/** All task data remains session-wide; consent is checked separately against the active branch. */
+	continuityPath(): string {
+		return join(this.directory, "continuity.json");
+	}
+
+	descendants(id: string): TaskRecord[] {
+		const ids = new Set([id]);
+		// Parents must predate children; bounded fixed point also handles restored record ordering.
+		for (let pass = 0; pass < this.records.size; pass++) {
+			const before = ids.size;
+			for (const entry of this.records.values())
+				if (entry.parentTaskId && ids.has(entry.parentTaskId)) ids.add(entry.id);
+			if (before === ids.size) break;
+		}
+		return this.list(true).filter((entry) => ids.has(entry.id) || (entry.taskId && ids.has(entry.taskId)));
+	}
+
+	createTask(label: string, dependencies: string[] = [], parentTaskId?: string): TaskRecord {
 		this.assertOpen();
 		if (!label.trim() || label.length > 500) throw new Error("Task label must contain 1–500 characters");
 		if (dependencies.length > 100) throw new Error("At most 100 dependencies are supported");
 		for (const id of dependencies) {
 			if (this.get(id).kind !== "task") throw new Error("Dependencies must be logical task IDs");
 		}
-		// Only previously created tasks can be dependencies, so cycles cannot be introduced.
+		if (parentTaskId) {
+			const parent = this.get(parentTaskId);
+			if (parent.kind !== "task" || parent.review || !["pending", "running"].includes(parent.status))
+				throw new Error("Parent must be an active logical task");
+			if (this.list(true).some((entry) => entry.taskId === parent.id))
+				throw new Error("An executor's leaf task cannot become a parent");
+		}
+		// Only previously created tasks can be dependencies or parents, so cycles cannot be introduced.
 		const record: TaskRecord = {
 			id: `task-${randomUUID()}`,
 			kind: "task",
 			label,
 			status: "pending",
 			dependencies: [...new Set(dependencies)],
+			...(parentTaskId ? { parentTaskId } : {}),
 			createdAt: Date.now(),
 			updatedAt: Date.now(),
 		};
@@ -237,17 +284,39 @@ export class TaskManager {
 		return this.get(record.id);
 	}
 
-	updateTask(id: string, status: "pending" | "running" | "completed" | "stopped"): TaskRecord {
+	updateTask(
+		id: string,
+		status?: "pending" | "running" | "completed" | "stopped",
+		checkpoint: TaskCheckpoint = {},
+	): TaskRecord {
 		if (this.closing) throw new Error("Task runtime is shutting down");
 		const record = this.get(id);
 		if (record.kind !== "task") throw new Error("Job status comes from process execution, not manual updates");
-		if (this.list().some((job) => job.taskId === id && (job.status === "running" || job.status === "unknown"))) {
+		if (
+			status &&
+			this.list().some((job) => job.taskId === id && (job.status === "running" || job.status === "unknown"))
+		) {
 			throw new Error("Task has a live or unmanaged job; stop or resolve that job first");
 		}
-		if (record.status === "awaiting_result") throw new Error("Result is ready; use acknowledge after processing it");
+		if (status && record.status === "awaiting_result")
+			throw new Error("Result is ready; use acknowledge after processing it");
 		if (record.review === "acknowledged") throw new Error("Archived tasks cannot be restarted; create a new task");
+		if (status && record.review === "awaiting")
+			throw new Error("Process and acknowledge the stopped result; create a new task instead of replaying it");
 		if (status === "running" || status === "completed") this.checkDependencies(record);
-		record.status = status;
+		if (
+			status === "completed" &&
+			this.descendants(id).some((entry) => entry.id !== id && entry.review !== "acknowledged")
+		)
+			throw new Error("Process all child tasks and executors before completing the parent");
+		if (status) record.status = status;
+		if (checkpoint.phase !== undefined) record.phase = checkpoint.phase;
+		if (checkpoint.summary !== undefined) record.summary = checkpoint.summary;
+		if (checkpoint.nextAction === null) delete record.nextAction;
+		else if (checkpoint.nextAction !== undefined) record.nextAction = structuredClone(checkpoint.nextAction);
+		if (checkpoint.blockedReason === null) delete record.blockedReason;
+		else if (checkpoint.blockedReason !== undefined) record.blockedReason = checkpoint.blockedReason;
+		if (!Check(recordSchema, record)) throw new Error("Invalid or oversized task checkpoint");
 		// Manually marking a logical task complete is already an explicit processing decision.
 		if (status === "completed") {
 			record.review = "acknowledged";
@@ -262,7 +331,9 @@ export class TaskManager {
 		if (!summary.trim() || summary.length > 1000)
 			throw new Error("Acknowledgement requires a 1–1000 character processing summary");
 		const record = this.get(id);
-		const job = record.kind === "job" ? record : this.list(true).find((entry) => entry.taskId === id);
+		const linked = record.kind === "task" ? this.list(true).filter((entry) => entry.taskId === id) : [];
+		if (linked.length > 1) throw new Error("Ambiguous task executors; inspect and acknowledge individual jobs");
+		const job = record.kind === "job" ? record : linked[0];
 		const task = record.kind === "task" ? record : record.taskId ? this.get(record.taskId) : undefined;
 		const related = [job, task].filter((entry): entry is TaskRecord => entry !== undefined);
 		for (const entry of related) {
@@ -288,7 +359,14 @@ export class TaskManager {
 		if (blocked.length) throw new Error(`Task is blocked by unfinished dependencies: ${blocked.join(", ")}`);
 	}
 
-	start(options: { command: string; cwd: string; label: string; timeout?: number; taskId?: string }): TaskRecord {
+	start(options: {
+		command: string;
+		cwd: string;
+		label: string;
+		timeout?: number;
+		taskId?: string;
+		parentTaskId?: string;
+	}): TaskRecord {
 		this.assertOpen();
 		if (!options.command.trim() || options.command.length > 32768)
 			throw new Error("Command must contain 1–32768 characters");
@@ -316,8 +394,20 @@ export class TaskManager {
 			throw new Error("Timeout must be positive and at most 604800 seconds");
 		const task = options.taskId ? this.get(options.taskId) : undefined;
 		if (task) {
-			if (task.kind !== "task" || task.status !== "pending") throw new Error("Linked task must be pending");
+			if (task.kind !== "task" || task.status !== "pending" || task.review)
+				throw new Error("Linked task must be pending and unreviewed");
+			if (this.list(true).some((entry) => entry.taskId === task.id || entry.parentTaskId === task.id))
+				throw new Error("Job requires an unused leaf task; do not replay an existing attempt");
 			this.checkDependencies(task);
+		}
+		if (options.parentTaskId) {
+			const parent = this.get(options.parentTaskId);
+			if (parent.kind !== "task" || parent.review || !["pending", "running"].includes(parent.status))
+				throw new Error("Invalid job parent task");
+			if (this.list(true).some((entry) => entry.taskId === parent.id))
+				throw new Error("An executor's leaf task cannot become a parent");
+			if (task && !this.descendants(parent.id).some((entry) => entry.id === task.id && entry.id !== parent.id))
+				throw new Error("Job/task plan ownership mismatch");
 		}
 		const record: TaskRecord = {
 			id: `job-${randomUUID()}`,
@@ -328,6 +418,7 @@ export class TaskManager {
 			command: options.command,
 			cwd,
 			...(task ? { taskId: task.id } : {}),
+			...(options.parentTaskId ? { parentTaskId: options.parentTaskId } : {}),
 			createdAt: Date.now(),
 			updatedAt: Date.now(),
 		};
@@ -423,12 +514,14 @@ export class TaskManager {
 				record.review = "awaiting";
 				this.finishRecord(record);
 				if (task) {
-					task.status = "awaiting_result";
-					task.resultStatus =
+					// A checkpoint may have changed while this detached executor was running.
+					const latestTask = this.get(task.id);
+					latestTask.status = "awaiting_result";
+					latestTask.resultStatus =
 						record.status === "completed" ? "completed" : record.status === "stopped" ? "stopped" : "failed";
-					task.review = "awaiting";
-					task.error = record.error;
-					this.finishRecord(task);
+					latestTask.review = "awaiting";
+					latestTask.error = record.error;
+					this.finishRecord(latestTask);
 				}
 				for (const monitor of this.monitors.values()) {
 					if (monitor.record.jobId === record.id && monitor.record.status === "watching")
