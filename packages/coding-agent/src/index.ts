@@ -25,6 +25,28 @@ export {
 } from "./core/agent-session.ts";
 export { readStoredCredential } from "./core/auth-storage.ts";
 export type { CacheWarmingDecision, CacheWarmingStatus } from "./core/cache-warmer.ts";
+// Detached child capability primitives (host adapter required; no implicit policy inheritance)
+export {
+	CHILD_RESOURCE_LIMITS,
+	type ChildResource,
+	type ChildResourceSelection,
+	type ChildResourceSnapshot,
+	type ChildRole,
+	type ChildSkillResource,
+	createChildResourceSnapshot,
+	type ResolvedChildResources,
+} from "./core/child-resources.ts";
+export {
+	CHILD_TOOL_SCOPE_LIMITS,
+	type ChildScopeIdentity,
+	type ChildToolDecision,
+	type ChildToolHostState,
+	type ChildToolInvocation,
+	type ChildToolRecord,
+	ChildToolScope,
+	type ChildToolScopeHost,
+	type ChildToolScopeOptions,
+} from "./core/child-tool-scope.ts";
 // Compaction
 export {
 	type BranchPreparation,
