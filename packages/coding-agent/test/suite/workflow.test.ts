@@ -32,6 +32,7 @@ async function setup(options: WorkflowOptions = {}, gate?: (pi: ExtensionAPI) =>
 	const controlled: ChildRunner = async (options) => {
 		await options.beforeRequest();
 		options.signal.throwIfAborted();
+		options.onRequestDispatched?.();
 		return new Promise<ChildResult>((resolve, reject) => {
 			const abort = () => reject(new Error("child aborted"));
 			options.signal.addEventListener("abort", abort, { once: true });
@@ -153,6 +154,96 @@ describe("independent Workflow (QuickJS and faux/local runners only)", () => {
 		expect((await call(harness, { action: "result", id: started.workflow.id })).usage).toBeUndefined();
 	});
 
+	it("exposes live per-child and per-request reported tokens while another child is still pending", async () => {
+		const { harness, executions } = await setup();
+		const started = await launch(harness, "return await parallel([()=>agent('one'),()=>agent('two')]);");
+		await vi.waitFor(() => expect(executions).toHaveLength(2));
+		executions[0].complete("first", 17);
+		const status = await call(harness, { action: "status", id: started.workflow.id });
+		expect(status.details).toMatchObject({
+			workflow: {
+				status: "running",
+				usage: { totalTokens: 17 },
+				agents: [
+					{
+						usage: { totalTokens: 17 },
+						requests: [{ status: "reported", source: "request_gate", usage: { totalTokens: 17 } }],
+					},
+					{ usage: { totalTokens: 0 }, requests: [{ status: "in_flight", source: "request_gate" }] },
+				],
+			},
+		});
+		expect(status.usage).toBeUndefined(); // Inspecting must not bill the parent twice.
+		executions[1].complete("second", 23);
+		await ready(harness, started.workflow.id);
+		const result = await call(harness, { action: "result", id: started.workflow.id });
+		expect(result.usage?.totalTokens).toBe(40);
+	});
+
+	it("keeps separate model-request/cache counters rather than merging a child's requests", async () => {
+		const { harness } = await setup({
+			runChild: async (options) => {
+				await options.beforeRequest();
+				const first = { ...emptyUsage(), input: 10, output: 5, cacheRead: 100, totalTokens: 115 };
+				options.onUsage(first);
+				await options.beforeRequest();
+				const second = { ...emptyUsage(), input: 20, output: 10, totalTokens: 30 };
+				options.onUsage(second);
+				return { output: "two responses", usage: { ...emptyUsage(), totalTokens: 145 }, turns: 2 };
+			},
+		});
+		const started = await launch(harness);
+		await ready(harness, started.workflow.id);
+		const result = await call(harness, { action: "result", id: started.workflow.id });
+		expect(result.details).toMatchObject({
+			workflow: {
+				usage: { totalTokens: 145, input: 30, output: 15, cacheRead: 100 },
+				agents: [
+					{
+						usage: { totalTokens: 145 },
+						requests: [
+							{ id: `${started.workflow.id}/agent-1/request-1`, usage: { totalTokens: 115, cacheRead: 100 } },
+							{ id: `${started.workflow.id}/agent-1/request-2`, usage: { totalTokens: 30 } },
+						],
+					},
+				],
+			},
+		});
+	});
+
+	it("distinguishes a trusted confirmed zero report from unknown zero defaults", async () => {
+		const { harness } = await setup({
+			runChild: async (options) => {
+				await options.beforeRequest();
+				options.onRequestDispatched?.();
+				options.onUsage(emptyUsage(), { reported: true });
+				return { output: "known zero", usage: emptyUsage(), turns: 1 };
+			},
+		});
+		const started = await launch(harness);
+		await ready(harness, started.workflow.id);
+		expect((await call(harness, { action: "result", id: started.workflow.id })).details).toMatchObject({
+			workflow: { agents: [{ turns: 1, requests: [{ status: "reported", usage: { totalTokens: 0 } }] }] },
+		});
+	});
+
+	it("persists queued children immediately and preserves dispatch attempts after stopping", async () => {
+		const { harness, executions } = await setup({ limits: { concurrency: 1 } });
+		const started = await launch(harness, "return await parallel([()=>agent('one'),()=>agent('two')]);");
+		await vi.waitFor(() =>
+			expect(JSON.parse(readFileSync(started.resultPath, "utf8")).agents).toMatchObject([
+				{ status: "running", turns: 1, requests: [{ dispatchedAt: expect.any(Number) }] },
+				{ status: "queued", turns: 0, requests: [] },
+			]),
+		);
+		expect(executions).toHaveLength(1);
+		await harness.session.prompt(`/workflow stop ${started.workflow.id}`);
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8")).agents).toMatchObject([
+			{ status: "stopped", turns: 1, requests: [{ status: "unknown", dispatchedAt: expect.any(Number) }] },
+			{ status: "stopped", turns: 0, requests: [] },
+		]);
+	});
+
 	it("keeps results active until retrieval and explicit processing acknowledgement; retains history", async () => {
 		const { harness, executions } = await setup();
 		const started = await launch(harness);
@@ -219,9 +310,10 @@ describe("independent Workflow (QuickJS and faux/local runners only)", () => {
 		await harness.session.prompt(`/workflow stop ${started.workflow.id}`);
 		expect(executions[0].options.signal.aborted).toBe(true);
 		expect(executions).toHaveLength(1);
-		expect(JSON.stringify((await call(harness, { action: "status", id: started.workflow.id })).details)).toContain(
-			"stopped",
-		);
+		const stopped = await call(harness, { action: "status", id: started.workflow.id });
+		expect(stopped.details).toMatchObject({
+			workflow: { outcome: "stopped", agents: [{ requests: [{ status: "unknown" }] }, { requests: [] }] },
+		});
 		await new Promise((resolve) => setTimeout(resolve, 300));
 		expect(notices.some((text) => text.includes("tokens"))).toBe(false);
 	});
@@ -341,7 +433,11 @@ describe("independent Workflow (QuickJS and faux/local runners only)", () => {
 			sessionId: harness.sessionManager.getSessionId(),
 		});
 		extraManagers.push(restored);
-		expect(restored.get(started.workflow.id)).toMatchObject({ status: "awaiting_result", outcome: "unknown" });
+		expect(restored.get(started.workflow.id)).toMatchObject({
+			status: "awaiting_result",
+			outcome: "unknown",
+			agents: [{ requests: [{ status: "unknown" }] }],
+		});
 		expect(() => restored.resume(started.workflow.id)).toThrow("never restarted");
 		await expect(restored.stop(started.workflow.id)).rejects.toThrow("previous runtime");
 		let routes = 0;
@@ -375,23 +471,32 @@ describe("independent Workflow (QuickJS and faux/local runners only)", () => {
 		initTheme("dark", false);
 		const { harness, executions } = await setup();
 		const widths: number[] = [];
+		const rows: string[] = [];
+		const statuses: string[] = [];
 		let widgetVisible = false;
 		const ui = createTestUiContext({
+			setStatus: (_key, text) => {
+				if (text) statuses.push(text);
+			},
 			setWidget: (_key, content) => {
 				widgetVisible = content !== undefined;
-				if (typeof content === "function")
-					widths.push(
-						...content({} as Parameters<typeof content>[0], ui.theme)
-							.render(25)
-							.map(visibleWidth),
-					);
+				if (typeof content === "function") {
+					const widget = content({} as Parameters<typeof content>[0], ui.theme);
+					widths.push(...widget.render(25).map(visibleWidth));
+					rows.push(...widget.render(180));
+				}
 			},
 		});
 		await harness.session.bindExtensions({ mode: "tui", uiContext: ui });
 		const started = await launch(harness);
 		await vi.waitFor(() => expect(executions).toHaveLength(1));
+		expect(rows.join("\n")).toContain("1 in-flight");
+		expect(statuses.join("\n")).toContain("0 tok reported");
 		executions[0].complete("中文结果");
 		await ready(harness, started.workflow.id);
+		expect(rows.join("\n")).toContain("12 tok reported");
+		expect(rows.join("\n")).toContain("req 1 reported 12 tok");
+		expect(statuses.join("\n")).toContain("12 tok reported");
 		expect(widgetVisible).toBe(true);
 		expect(widths.length).toBeGreaterThan(0);
 		expect(widths.every((width) => width <= 25)).toBe(true);
@@ -439,6 +544,9 @@ describe("independent Workflow (QuickJS and faux/local runners only)", () => {
 		await ready(harness, started.workflow.id);
 		expect(harness.getPendingResponseCount()).toBe(1);
 		expect(readFileSync(started.resultPath, "utf8")).toContain("Child turn limit reached");
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8")).agents).toMatchObject([
+			{ turns: 1, requests: [{ dispatchedAt: expect.any(Number) }] },
+		]);
 	});
 
 	it("runs real isolated Agent loops with faux responses and enforces workspace/tool policy", async () => {

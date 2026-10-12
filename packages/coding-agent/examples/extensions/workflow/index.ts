@@ -16,6 +16,7 @@ import { WorkflowManager } from "./manager.ts";
 import { registerWorkflowMode } from "./mode.ts";
 import { createScriptRunner } from "./script.ts";
 import type { ChildRunner, ScriptRunner, WorkflowLimits, WorkflowRecord } from "./types.ts";
+import { workflowBacklogRows, workflowTokenLabel } from "./usage-view.ts";
 
 const limitsSchema = Type.Object(
 	{
@@ -80,7 +81,7 @@ function summary(record: WorkflowRecord) {
 		outcome: record.outcome,
 		phase: record.phase,
 		thinkingLevel: record.thinkingLevel,
-		agents: record.agents.map(({ id, role, label, phase, status, turns, thinkingLevel }) => ({
+		agents: record.agents.map(({ id, role, label, phase, status, turns, thinkingLevel, usage, requests }) => ({
 			id,
 			role,
 			label,
@@ -88,7 +89,10 @@ function summary(record: WorkflowRecord) {
 			status,
 			turns,
 			thinkingLevel,
+			usage,
+			requests,
 		})),
+		tokenObservation: "API-reported cumulative usage; in-flight and unknown requests are not zero-cost claims",
 		usage: record.usage,
 	};
 }
@@ -116,19 +120,17 @@ export function createWorkflowExtension(options: WorkflowOptions = {}): Extensio
 			const ready = records.filter((record) => record.status === "awaiting_result").length;
 			context.ui.setStatus(
 				"workflow",
-				`${records.length - ready} workflows / ${ready} results to process${pausedAfterAbort ? " / notices paused" : ""}`,
+				`${records.length - ready} workflows / ${ready} results to process / ${records.reduce((sum, record) => sum + record.usage.totalTokens, 0).toLocaleString("en-US")} tok reported${pausedAfterAbort ? " / notices paused" : ""}`,
 			);
 			context.ui.setWidget("workflow", (_tui, theme) => ({
 				invalidate() {},
 				render: (width) =>
 					[
-						theme.fg("muted", `Workflow backlog · /workflow help`),
-						...records
-							.slice(-4)
-							.map(
-								(record) =>
-									`[${record.status}${record.outcome ? `/${record.outcome}` : ""}] ${record.id.slice(0, 17)} ${safeText(record.label).replaceAll("\n", " ")} · ${safeText(record.phase).replaceAll("\n", " ")}`,
-							),
+						theme.fg(
+							"muted",
+							`Workflow tokens · live children / latest request · full history: /workflow status ID`,
+						),
+						...workflowBacklogRows(records),
 					].map((row) => truncateToWidth(row, width)),
 			}));
 		};
@@ -348,7 +350,7 @@ export function createWorkflowExtension(options: WorkflowOptions = {}): Extensio
 								.list(action === "history")
 								.map(
 									(record) =>
-										`${record.id} [${record.status}/${record.outcome ?? "live"}] ${safeText(record.label)}`,
+										`${record.id} [${record.status}/${record.outcome ?? "live"}] ${workflowTokenLabel(record)} · ${safeText(record.label)}`,
 								)
 								.join("\n") || "No active workflows",
 							"info",

@@ -16,6 +16,7 @@ import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Check } from "typebox/value";
 import { safeText } from "../task-monitor/manager.ts";
+import { normalizeWorkflowUsage } from "./budget.ts";
 import { clampWorkflowThinkingLevel } from "./effort.ts";
 import { prelude } from "./script.ts";
 import {
@@ -25,6 +26,7 @@ import {
 	type ChildRunner,
 	defaultLimits,
 	emptyUsage,
+	type ModelRequestRecord,
 	type ScriptRunner,
 	thinkingSchema,
 	type WorkflowLimits,
@@ -60,6 +62,21 @@ const recordSchema = Type.Object({
 			output: Type.Optional(Type.String({ maxLength: 16384 })),
 			error: Type.Optional(Type.String({ maxLength: 2000 })),
 			turns: Type.Optional(number),
+			usage: Type.Optional(usageSchema),
+			requests: Type.Optional(
+				Type.Array(
+					Type.Object({
+						id: Type.String(),
+						status: StringEnum(["in_flight", "reported", "unknown"] as const),
+						source: StringEnum(["request_gate", "usage_only"] as const),
+						startedAt: Type.Optional(number),
+						dispatchedAt: Type.Optional(number),
+						reportedAt: Type.Optional(number),
+						usage: Type.Optional(usageSchema),
+					}),
+					{ maxItems: 64 },
+				),
+			),
 			thinkingLevel: Type.Optional(thinkingSchema),
 		}),
 		{ maxItems: 32 },
@@ -154,11 +171,14 @@ export class WorkflowManager {
 					record.outcome = "unknown";
 					record.error =
 						"Previous runtime ended without a confirmed result. Nothing is automatically resumed or restarted.";
-					for (const agent of record.agents)
+					for (const agent of record.agents) {
+						for (const request of agent.requests ?? [])
+							if (request.status === "in_flight") request.status = "unknown";
 						if (agent.status === "running" || agent.status === "queued") {
 							agent.status = "stopped";
 							agent.error = "Previous runtime; result unknown";
 						}
+					}
 				}
 				this.records.set(record.id, record);
 			} catch {
@@ -313,9 +333,27 @@ export class WorkflowManager {
 						label: input.label ?? input.role ?? "worker",
 						phase: record.phase,
 						status: "queued",
+						turns: 0,
+						usage: emptyUsage(),
+						requests: [],
 						thinkingLevel: childThinkingLevel,
 					};
 					record.agents.push(agent);
+					this.save(record);
+					const requests = agent.requests!;
+					let currentRequest: ModelRequestRecord | undefined;
+					const newRequest = (source: ModelRequestRecord["source"]): ModelRequestRecord => {
+						if (requests.length >= this.limits.maxTurns)
+							throw new Error("Child request accounting limit reached");
+						const request: ModelRequestRecord = {
+							id: `${agent.id}/request-${requests.length + 1}`,
+							status: source === "request_gate" ? "in_flight" : "unknown",
+							source,
+							...(source === "request_gate" ? { startedAt: Date.now() } : {}),
+						};
+						requests.push(request);
+						return request;
+					};
 					const execution = (async () => {
 						let acquired = false;
 						try {
@@ -340,8 +378,32 @@ export class WorkflowManager {
 								maxTurns: this.limits.maxTurns,
 								maxOutputTokens: this.limits.maxOutputTokens,
 								signal,
-								beforeRequest: () => this.gate(record, runtime, signal),
-								onUsage: (usage) => {
+								beforeRequest: async () => {
+									await this.gate(record, runtime, signal);
+									if (currentRequest?.status === "in_flight")
+										throw new Error("Overlapping child model requests are unsupported");
+									currentRequest = newRequest("request_gate");
+									this.save(record);
+								},
+								onRequestDispatched: () => {
+									if (
+										!currentRequest ||
+										currentRequest.status !== "in_flight" ||
+										currentRequest.dispatchedAt !== undefined
+									)
+										throw new Error("Invalid child request dispatch observation");
+									currentRequest.dispatchedAt = Date.now();
+									agent.turns = (agent.turns ?? 0) + 1;
+									this.save(record);
+								},
+								onUsage: (source, observation) => {
+									const usage = normalizeWorkflowUsage(source);
+									const request = currentRequest ?? newRequest("usage_only");
+									request.usage = usage;
+									request.reportedAt = Date.now();
+									request.status = (observation?.reported ?? usage.totalTokens > 0) ? "reported" : "unknown";
+									currentRequest = undefined;
+									addUsage(agent.usage!, usage);
 									addUsage(record.usage, usage);
 									if (record.usage.totalTokens >= this.limits.maxTotalTokens) {
 										runtime.failure = {
@@ -356,7 +418,7 @@ export class WorkflowManager {
 							signal.throwIfAborted();
 							agent.status = "completed";
 							agent.output = result.output.slice(0, 16384);
-							agent.turns = result.turns;
+							if (!requests.some((request) => request.dispatchedAt !== undefined)) agent.turns = result.turns;
 							this.log(record, runtime, `Agent completed: ${agent.id}`);
 							const value: JsonValue = { id: agent.id, role: agent.role, output: agent.output };
 							return {
@@ -369,6 +431,7 @@ export class WorkflowManager {
 							agent.error = String(error).slice(0, 2000);
 							throw error;
 						} finally {
+							if (currentRequest?.status === "in_flight") currentRequest.status = "unknown";
 							if (acquired) runtime.active--;
 							this.wake(runtime);
 							this.save(record);

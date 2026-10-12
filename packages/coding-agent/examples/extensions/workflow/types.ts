@@ -23,6 +23,10 @@ export interface ChildResult {
 	usage: Usage;
 	turns: number;
 }
+export interface UsageObservation {
+	/** Trusted assertion that complete usage was received; can explicitly confirm a genuine zero. */
+	reported: boolean;
+}
 export interface ChildOptions {
 	id: string;
 	request: AgentRequest;
@@ -34,7 +38,9 @@ export interface ChildOptions {
 	maxOutputTokens: number;
 	signal: AbortSignal;
 	beforeRequest(): Promise<void>;
-	onUsage(usage: Usage): void;
+	/** Provider handoff attempt, not proof the server accepted/billed the request. */
+	onRequestDispatched?(): void;
+	onUsage(usage: Usage, observation?: UsageObservation): void;
 }
 export type ChildRunner = (options: ChildOptions) => Promise<ChildResult>;
 export type ScriptRunner = (
@@ -43,6 +49,18 @@ export type ScriptRunner = (
 	signal: AbortSignal,
 ) => Promise<AgentToolResult<unknown>>;
 
+export interface ModelRequestRecord {
+	id: string;
+	/** Billing observation, not whether the model response or assigned work succeeded. */
+	status: "in_flight" | "reported" | "unknown";
+	/** Trusted overrides may report usage without exposing an admission callback. */
+	source: "request_gate" | "usage_only";
+	startedAt?: number;
+	/** Time handed to the provider client; network acceptance is not asserted. */
+	dispatchedAt?: number;
+	reportedAt?: number;
+	usage?: Usage;
+}
 export interface AgentRecord {
 	id: string;
 	role: NonNullable<AgentRequest["role"]>;
@@ -52,6 +70,9 @@ export interface AgentRecord {
 	output?: string;
 	error?: string;
 	turns?: number;
+	/** Missing on historical records means unavailable, not zero. */
+	usage?: Usage;
+	requests?: ModelRequestRecord[];
 	/** Absent only on records created before effort accounting was introduced. */
 	thinkingLevel?: ThinkingLevel;
 }

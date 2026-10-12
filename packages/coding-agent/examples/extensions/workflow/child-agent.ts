@@ -62,6 +62,7 @@ export function createChildRunner(registry: ModelRegistry, model: Model<string>)
 			},
 		}));
 		let turns = 0;
+		let awaitingUsage = false;
 		const usage = emptyUsage();
 		const agent = new Agent({
 			initialState: {
@@ -73,10 +74,13 @@ export function createChildRunner(registry: ModelRegistry, model: Model<string>)
 			sessionId: options.id,
 			toolExecution: "sequential",
 			streamFn: async (selected, context, streamOptions) => {
-				await options.beforeRequest();
 				options.signal.throwIfAborted();
 				if (turns >= options.maxTurns) throw new Error(`Child turn limit reached (${options.maxTurns})`);
+				await options.beforeRequest();
+				options.signal.throwIfAborted();
+				options.onRequestDispatched?.();
 				turns++;
+				awaitingUsage = true;
 				return registry.streamSimple(selected, context, {
 					...streamOptions,
 					maxRetries: 0,
@@ -85,8 +89,11 @@ export function createChildRunner(registry: ModelRegistry, model: Model<string>)
 			},
 		});
 		const unsubscribe = agent.subscribe((event) => {
-			if (event.type === "message_end" && event.message.role === "assistant") {
+			if (event.type === "message_end" && event.message.role === "assistant" && awaitingUsage) {
+				awaitingUsage = false;
 				addUsage(usage, event.message.usage);
+				// Native messages currently cannot prove whether an all-zero usage was supplied
+				// by the provider or synthesized/defaulted. Keep it unknown unless a host can assert it.
 				options.onUsage(event.message.usage);
 			}
 		});

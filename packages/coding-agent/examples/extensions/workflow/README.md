@@ -206,6 +206,36 @@ become `awaiting_result/unknown`; no script is automatically replayed or process
 adopted. Unknown outcomes can be reviewed and archived as **unknown**, not promoted
 to success. This is not crash-resumable execution or a cross-process daemon.
 
+### Running token visibility
+
+The TUI backlog and footer show cumulative **API-reported** tokens while a workflow
+is running, not only after completion. Live workflows have display priority, and
+all running child rows show their cumulative usage and latest model-request
+observation. Queue counts and recent results are bounded summaries, not full history. `/workflow status ID` and the
+`workflow status/result` tool responses expose every retained child's `usage` and
+bounded `requests` with input/output/cache-read/cache-write/total/cost fields.
+Use the returned persisted metadata path when the human-readable response is truncated.
+
+Request observations are `in_flight`, `reported`, or `unknown`. `reported` means
+usage was received; it does not claim the response or task succeeded. Requests
+interrupted without usage, including after reload, stay unknown, not zero-cost.
+Missing historical per-child data is unavailable, not a reconstructed zero. A
+trusted runner can explicitly assert a complete genuine zero with
+`onUsage(usage, {reported: true})`; unmarked all-zero native usage remains unknown
+because the current provider message contract cannot distinguish omitted/default
+metrics from supplied zero metrics. `onRequestDispatched()` persists a provider
+handoff attempt, including on failure/stop; it does not prove server acceptance.
+A trusted host runner that supplies usage without a request gate is labeled
+`usage_only`, with no fabricated request start time.
+
+Providers commonly publish usage only at response completion. The display updates
+on local gates/usage events; it does not poll or pretend to have live billed-token
+counts for an in-flight response. Estimated admission reservations will be a
+separate display once the budget ledger is connected to runtime admission; the
+standalone ledger does not yet change the response-completion budget boundary below.
+Inspecting status does not add child usage to the main session again. The first
+ready tool-result retrieval still accounts it once.
+
 ## Limits and boundaries
 
 - 2 live Workflows and 256 retained Workflow records per session runtime.
@@ -249,7 +279,8 @@ From `packages/coding-agent`:
 node ../../node_modules/vitest/dist/cli.js --run \
   test/thinking-selector.test.ts test/suite/workflow-mode.test.ts \
   test/suite/workflow.test.ts test/task-monitor-manager.test.ts \
-  test/suite/task-monitor.test.ts
+  test/suite/task-monitor.test.ts test/workflow-budget.test.ts \
+  test/workflow-usage-view.test.ts
 ```
 
 The tests use real QuickJS workers, controlled local child runners and the faux
