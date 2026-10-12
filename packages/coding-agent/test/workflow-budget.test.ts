@@ -88,6 +88,20 @@ describe("Workflow request budget ledger", () => {
 		expect(() => ledger.reserve(estimate("r2"))).toThrow(BudgetAdmissionError);
 	});
 
+	it("exposes overcommitted estimates separately from reported overspend", () => {
+		const ledger = new WorkflowBudgetLedger(1000);
+		sent(ledger, "r1", { estimatedInputTokens: 340 });
+		sent(ledger, "r2", { agentId: "agent-b", estimatedInputTokens: 340 });
+		ledger.settle("r1", usage(700));
+		expect(ledger.snapshot()).toMatchObject({
+			usage: { totalTokens: 700 },
+			reservedTokens: 400,
+			overspentTokens: 0,
+			overcommittedTokens: 100,
+			requests: [{ underestimatedTokens: 300 }, {}],
+		});
+	});
+
 	it("treats exactly reaching a limit as a boundary, without inventing overspend", () => {
 		const ledger = new WorkflowBudgetLedger(200);
 		sent(ledger, "r1");

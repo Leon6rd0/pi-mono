@@ -41,7 +41,13 @@ async function setup(options: WorkflowOptions = {}, reasoning = true, sessionMan
 				storageRoot: root,
 				notifyModel: false,
 				runChild: async (child) => {
-					await child.beforeRequest();
+					const requestId = await child.beforeRequest({
+						estimatedInputTokens: 0,
+						maxOutputTokens: 1,
+						marginTokens: 0,
+						estimator: "trusted_host",
+					});
+					child.onRequestDispatched?.(requestId);
 					return new Promise<ChildResult>((resolve, reject) => {
 						const abort = () => reject(new Error("child aborted"));
 						child.signal.addEventListener("abort", abort, { once: true });
@@ -49,6 +55,7 @@ async function setup(options: WorkflowOptions = {}, reasoning = true, sessionMan
 							options: child,
 							complete: () => {
 								child.signal.removeEventListener("abort", abort);
+								child.onUsage(emptyUsage(), { reported: true }, requestId);
 								resolve({ output: "local finding", usage: emptyUsage(), turns: 1 });
 							},
 						});
@@ -430,7 +437,7 @@ describe("Workflow thinking mode (no real provider calls)", () => {
 			maxTurns: 1,
 			maxOutputTokens: 100,
 			signal: new AbortController().signal,
-			beforeRequest: async () => {},
+			beforeRequest: async () => "effort-request",
 			onUsage: () => {},
 		});
 		expect(result.output).toBe("Verified effort transmission");

@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { WorkflowBudgetLedger } from "../examples/extensions/workflow/budget.ts";
 import { type AgentRecord, emptyUsage, type WorkflowRecord } from "../examples/extensions/workflow/types.ts";
 import {
 	agentTokenLabel,
 	workflowBacklogRows,
 	workflowTokenLabel,
+	workflowUsageObservation,
 } from "../examples/extensions/workflow/usage-view.ts";
 
 function agent(overrides: Partial<AgentRecord> = {}): AgentRecord {
@@ -49,6 +51,37 @@ describe("Workflow usage presentation", () => {
 			],
 		});
 		expect(workflowTokenLabel(record)).toBe("19,599 tok reported · 1 in-flight · 1 unknown");
+	});
+
+	it("labels reservations/unknown debits as estimates separate from reported usage", () => {
+		const ledger = new WorkflowBudgetLedger(1000);
+		ledger.reserve({
+			id: "r1",
+			agentId: "a",
+			phaseId: "p",
+			estimatedInputTokens: 69,
+			maxOutputTokens: 1,
+			marginTokens: 0,
+		});
+		ledger.markDispatched("r1");
+		ledger.markUnknown("r1");
+		const label = workflowTokenLabel(workflow({ budget: ledger.snapshot() }));
+		expect(label).toContain("0 tok reported");
+		expect(label).toContain("70 reserved est (70 unknown) · 930 available");
+	});
+
+	it("marks historical/restored accounting unavailable or partial, not confirmed complete zero", () => {
+		expect(
+			workflowUsageObservation(
+				workflow({ status: "awaiting_result", agents: [agent({ requests: undefined, usage: undefined })] }),
+			),
+		).toMatchObject({ completeness: "unavailable" });
+		expect(
+			workflowUsageObservation(workflow({ status: "awaiting_result", outcome: "unknown", agents: [] })),
+		).toMatchObject({ completeness: "partial" });
+		expect(
+			workflowUsageObservation(workflow({ status: "awaiting_result", outcome: "completed", agents: [] })),
+		).toMatchObject({ completeness: "complete", unknownRequests: 0 });
 	});
 
 	it("does not claim missing historical child usage is zero", () => {

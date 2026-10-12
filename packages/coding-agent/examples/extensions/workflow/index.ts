@@ -16,7 +16,7 @@ import { WorkflowManager } from "./manager.ts";
 import { registerWorkflowMode } from "./mode.ts";
 import { createScriptRunner } from "./script.ts";
 import type { ChildRunner, ScriptRunner, WorkflowLimits, WorkflowRecord } from "./types.ts";
-import { workflowBacklogRows, workflowTokenLabel } from "./usage-view.ts";
+import { workflowBacklogRows, workflowTokenLabel, workflowUsageObservation } from "./usage-view.ts";
 
 const limitsSchema = Type.Object(
 	{
@@ -80,19 +80,52 @@ function summary(record: WorkflowRecord) {
 		status: record.status,
 		outcome: record.outcome,
 		phase: record.phase,
+		phaseId: record.phaseId,
+		phases: record.phases,
+		budget: record.budget,
+		deliveryComplete: record.deliveryComplete,
+		resultTruncated: record.resultTruncated,
+		resultOriginalLength: record.resultOriginalLength,
 		thinkingLevel: record.thinkingLevel,
-		agents: record.agents.map(({ id, role, label, phase, status, turns, thinkingLevel, usage, requests }) => ({
-			id,
-			role,
-			label,
-			phase,
-			status,
-			turns,
-			thinkingLevel,
-			usage,
-			requests,
-		})),
+		agents: record.agents.map(
+			({
+				id,
+				role,
+				label,
+				phase,
+				phaseId,
+				status,
+				turns,
+				thinkingLevel,
+				usage,
+				requests,
+				budget,
+				progress,
+				outputTruncated,
+				outputOriginalLength,
+			}) => ({
+				id,
+				role,
+				label,
+				phase,
+				phaseId,
+				status,
+				turns,
+				thinkingLevel,
+				usage,
+				requests,
+				budget,
+				progress,
+				outputTruncated,
+				outputOriginalLength,
+			}),
+		),
+		progressObservation:
+			"Bounded untrusted partial execution observations; not test PASS, rollback, acceptance, or resume authority",
 		tokenObservation: "API-reported cumulative usage; in-flight and unknown requests are not zero-cost claims",
+		usageObservation: workflowUsageObservation(record),
+		deliveryObservation:
+			"completed describes script execution, not task acceptance; deliveryComplete is false for failed/stopped children or truncated output",
 		usage: record.usage,
 	};
 }
@@ -120,7 +153,7 @@ export function createWorkflowExtension(options: WorkflowOptions = {}): Extensio
 			const ready = records.filter((record) => record.status === "awaiting_result").length;
 			context.ui.setStatus(
 				"workflow",
-				`${records.length - ready} workflows / ${ready} results to process / ${records.reduce((sum, record) => sum + record.usage.totalTokens, 0).toLocaleString("en-US")} tok reported${pausedAfterAbort ? " / notices paused" : ""}`,
+				`${records.length - ready} workflows / ${ready} results to process / ${records.reduce((sum, record) => sum + record.usage.totalTokens, 0).toLocaleString("en-US")} tok reported / ${records.reduce((sum, record) => sum + (record.budget?.reservedTokens ?? 0), 0).toLocaleString("en-US")} reserved est${pausedAfterAbort ? " / notices paused" : ""}`,
 			);
 			context.ui.setWidget("workflow", (_tui, theme) => ({
 				invalidate() {},
@@ -225,7 +258,7 @@ export function createWorkflowExtension(options: WorkflowOptions = {}): Extensio
 			name: "workflow",
 			label: "Workflow",
 			description:
-				"Independent Claude-style scripted multi-agent Workflow, not Codex Ultra. ONLY start with explicit user opt-in or trusted session Workflow mode ON. start(label,cwd,code,args?,provider?,model?,write_access?) returns an ID immediately. list/status/result/pause/resume/stop/acknowledge track suspended work. Script API: agent(prompt,{role?,label?,effort?}) -> {id,role,output}; parallel([()=>agent(...),...]); pipeline(items,mapper,{concurrency?}); await phase(title), log(text), checkpoint(); args is input. Roles: scout, worker, reviewer, summarizer. Only worker can write when write_access and trusted allowWrites config are both enabled. No shell/MCP/extensions/delegation in children. Pause is cooperative, not a frozen model request. Models must be physical, never virtual routers. Results remain active until read, processed and acknowledged with summary.",
+				"Independent Claude-style scripted multi-agent Workflow, not Codex Ultra. ONLY start with explicit user opt-in or trusted session Workflow mode ON. start(label,cwd,code,args?,provider?,model?,write_access?) returns an ID immediately. list/status/result/pause/resume/stop/acknowledge track suspended work. Script API: agent(prompt,{role?,label?,effort?,maxTotalTokens?}) -> {id,role,output}; parallel([()=>agent(...),...]); pipeline(items,mapper,{concurrency?}); await phase(title,{maxTotalTokens?}), log(text), checkpoint(); args is input. Roles: scout, worker, reviewer, summarizer. Only worker can write when write_access and trusted allowWrites config are both enabled. No shell/MCP/extensions/delegation in children. Pause is cooperative, not a frozen model request. Models must be physical, never virtual routers. Results remain active until read, processed and acknowledged with summary.",
 			promptSnippet: "Start and track a background, isolated multi-agent Workflow independent of Ultra",
 			promptGuidelines: [
 				"Workflow start is asynchronous. Finish the current response and remain available; never wait, sleep-loop or repeatedly poll for it. Real ready events arrive locally.",
@@ -318,7 +351,11 @@ export function createWorkflowExtension(options: WorkflowOptions = {}): Extensio
 							: { result: result.workflow.result }),
 					};
 					return {
-						...dataResult({ resultPath: current.recordPath(params.id), workflow }),
+						...dataResult({
+							resultPath: current.recordPath(params.id),
+							workflow,
+							usageObservation: workflowUsageObservation(result.workflow),
+						}),
 						...(result.usage ? { usage: result.usage } : {}),
 					};
 				}

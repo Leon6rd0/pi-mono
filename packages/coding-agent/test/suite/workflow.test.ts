@@ -13,6 +13,7 @@ import {
 	type ChildResult,
 	type ChildRunner,
 	emptyUsage,
+	type ModelRequestEstimate,
 } from "../../examples/extensions/workflow/types.ts";
 import { createHarness, createTestUiContext, getToolResult, type Harness } from "./harness.ts";
 
@@ -20,30 +21,42 @@ const harnesses: Harness[] = [];
 const extraManagers: WorkflowManager[] = [];
 const directories: string[] = [];
 const resultPaths = new Map<string, string>();
+const mockEstimate = {
+	estimatedInputTokens: 0,
+	maxOutputTokens: 1,
+	marginTokens: 0,
+	estimator: "trusted_host" as const,
+};
 interface Execution {
 	options: ChildOptions;
+	requestId: string;
 	complete(output: string, tokens?: number): void;
 }
-async function setup(options: WorkflowOptions = {}, gate?: (pi: ExtensionAPI) => void) {
+async function setup(
+	options: WorkflowOptions = {},
+	gate?: (pi: ExtensionAPI) => void,
+	estimate: ModelRequestEstimate = mockEstimate,
+) {
 	const executions: Execution[] = [];
 	const notices: string[] = [];
 	const storageRoot = mkdtempSync(join(tmpdir(), "pi-workflow-"));
 	directories.push(storageRoot);
 	const controlled: ChildRunner = async (options) => {
-		await options.beforeRequest();
+		const requestId = await options.beforeRequest(estimate);
 		options.signal.throwIfAborted();
-		options.onRequestDispatched?.();
+		options.onRequestDispatched?.(requestId);
 		return new Promise<ChildResult>((resolve, reject) => {
 			const abort = () => reject(new Error("child aborted"));
 			options.signal.addEventListener("abort", abort, { once: true });
 			executions.push({
 				options,
+				requestId,
 				complete: (output, tokens = 12) => {
 					options.signal.removeEventListener("abort", abort);
 					const usage = emptyUsage();
 					usage.totalTokens = tokens;
 					usage.output = tokens;
-					options.onUsage(usage);
+					options.onUsage(usage, undefined, requestId);
 					resolve({ output, usage, turns: 1 });
 				},
 			});
@@ -183,12 +196,14 @@ describe("independent Workflow (QuickJS and faux/local runners only)", () => {
 	it("keeps separate model-request/cache counters rather than merging a child's requests", async () => {
 		const { harness } = await setup({
 			runChild: async (options) => {
-				await options.beforeRequest();
+				const firstId = await options.beforeRequest(mockEstimate);
+				options.onRequestDispatched?.(firstId);
 				const first = { ...emptyUsage(), input: 10, output: 5, cacheRead: 100, totalTokens: 115 };
-				options.onUsage(first);
-				await options.beforeRequest();
+				options.onUsage(first, undefined, firstId);
+				const secondId = await options.beforeRequest(mockEstimate);
+				options.onRequestDispatched?.(secondId);
 				const second = { ...emptyUsage(), input: 20, output: 10, totalTokens: 30 };
-				options.onUsage(second);
+				options.onUsage(second, undefined, secondId);
 				return { output: "two responses", usage: { ...emptyUsage(), totalTokens: 145 }, turns: 2 };
 			},
 		});
@@ -214,9 +229,9 @@ describe("independent Workflow (QuickJS and faux/local runners only)", () => {
 	it("distinguishes a trusted confirmed zero report from unknown zero defaults", async () => {
 		const { harness } = await setup({
 			runChild: async (options) => {
-				await options.beforeRequest();
-				options.onRequestDispatched?.();
-				options.onUsage(emptyUsage(), { reported: true });
+				const requestId = await options.beforeRequest(mockEstimate);
+				options.onRequestDispatched?.(requestId);
+				options.onUsage(emptyUsage(), { reported: true }, requestId);
 				return { output: "known zero", usage: emptyUsage(), turns: 1 };
 			},
 		});
@@ -242,6 +257,328 @@ describe("independent Workflow (QuickJS and faux/local runners only)", () => {
 			{ status: "stopped", turns: 1, requests: [{ status: "unknown", dispatchedAt: expect.any(Number) }] },
 			{ status: "stopped", turns: 0, requests: [] },
 		]);
+	});
+
+	it("reserves before dispatch and waits for a real settlement instead of sharing remaining tokens", async () => {
+		const { harness, executions } = await setup({ limits: { maxTotalTokens: 100 } }, undefined, {
+			...mockEstimate,
+			estimatedInputTokens: 69,
+		});
+		const started = await launch(harness, "return await parallel([()=>agent('one'),()=>agent('two')]);");
+		await vi.waitFor(() => expect(JSON.parse(readFileSync(started.resultPath, "utf8")).agents).toHaveLength(2));
+		expect(executions).toHaveLength(1);
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8")).budget).toMatchObject({
+			reservedTokens: 70,
+			availableTokens: 30,
+		});
+		executions[0].complete("first", 10);
+		await vi.waitFor(() => expect(executions).toHaveLength(2));
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8")).budget).toMatchObject({
+			reservedTokens: 70,
+			availableTokens: 20,
+			usage: { totalTokens: 10 },
+		});
+		executions[1].complete("second", 10);
+		await ready(harness, started.workflow.id);
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8")).budget).toMatchObject({
+			reservedTokens: 0,
+			usage: { totalTokens: 20 },
+		});
+	});
+
+	it("fails an unaffordable admission before any provider handoff even if the script catches it", async () => {
+		const { harness, executions } = await setup({ limits: { maxTotalTokens: 50 } }, undefined, {
+			...mockEstimate,
+			estimatedInputTokens: 69,
+		});
+		const started = await launch(harness, "try { await agent('too large'); } catch {} return 'caught';");
+		await ready(harness, started.workflow.id);
+		expect(executions).toHaveLength(0);
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8"))).toMatchObject({
+			outcome: "failed",
+			usage: { totalTokens: 0 },
+			agents: [{ turns: 0, requests: [] }],
+		});
+		expect(readFileSync(started.resultPath, "utf8")).toContain("budget exhausted at workflow admission");
+	});
+
+	it("unknown usage keeps its debit and wakes a blocked admission into explicit failure, not another call", async () => {
+		const { harness, executions } = await setup({ limits: { maxTotalTokens: 100 } }, undefined, {
+			...mockEstimate,
+			estimatedInputTokens: 69,
+		});
+		const started = await launch(harness, "return await parallel([()=>agent('one'),()=>agent('two')]);");
+		await vi.waitFor(() => expect(executions).toHaveLength(1));
+		executions[0].complete("unreported", 0);
+		await ready(harness, started.workflow.id);
+		expect(executions).toHaveLength(1);
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8"))).toMatchObject({
+			outcome: "failed",
+			budget: { reservedTokens: 70, unknownTokens: 70, usage: { totalTokens: 0 } },
+		});
+	});
+
+	it("refunds only a confirmed unsent admission on failure", async () => {
+		const { harness } = await setup({
+			limits: { maxTotalTokens: 100 },
+			runChild: async (options) => {
+				await options.beforeRequest({ ...mockEstimate, estimatedInputTokens: 69 });
+				throw new Error("local preparation failed before handoff");
+			},
+		});
+		const started = await launch(harness);
+		await ready(harness, started.workflow.id);
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8"))).toMatchObject({
+			budget: { reservedTokens: 0, availableTokens: 100 },
+			agents: [{ turns: 0, requests: [{ status: "not_sent" }] }],
+		});
+	});
+
+	it("settles by request ID once and keeps late usage attached to its original phase", async () => {
+		const { harness, executions } = await setup();
+		const started = await launch(
+			harness,
+			"await phase('first'); await agent('one'); await phase('second'); return await agent('two');",
+		);
+		await vi.waitFor(() => expect(executions).toHaveLength(1));
+		executions[0].complete("first with missing metrics", 0);
+		await vi.waitFor(() => expect(executions).toHaveLength(2));
+		const late = { ...emptyUsage(), cacheRead: 12, totalTokens: 12 };
+		executions[0].options.onUsage(late, undefined, executions[0].requestId);
+		executions[0].options.onUsage(late, undefined, executions[0].requestId);
+		executions[1].complete("second", 10);
+		await ready(harness, started.workflow.id);
+		const record = JSON.parse(readFileSync(started.resultPath, "utf8"));
+		expect(record.usage.totalTokens).toBe(22);
+		expect(record.budget.phases).toMatchObject([
+			{ id: "phase-1", usage: { totalTokens: 0 } },
+			{ id: "phase-2", usage: { totalTokens: 12 } },
+			{ id: "phase-3", usage: { totalTokens: 10 } },
+		]);
+	});
+
+	it.each([
+		"await phase('limited',{maxTotalTokens:50}); return await agent('one');",
+		"return await agent('one',{maxTotalTokens:50});",
+	])("enforces explicit phase/child allocations before calls: %s", async (code) => {
+		const { harness, executions } = await setup({}, undefined, { ...mockEstimate, estimatedInputTokens: 69 });
+		const started = await launch(harness, code);
+		await ready(harness, started.workflow.id);
+		expect(executions).toHaveLength(0);
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8")).outcome).toBe("failed");
+	});
+
+	it("retains a bounded checkpoint and unknown mutation before an over-budget cancellation", async () => {
+		const { harness } = await setup({
+			limits: { maxTotalTokens: 100 },
+			runChild: async (options) => {
+				const id = await options.beforeRequest({ ...mockEstimate, estimatedInputTokens: 69 });
+				options.onRequestDispatched?.(id);
+				options.onProgress?.({
+					partial: true,
+					output: "finding retained before cancel",
+					outputTruncated: false,
+					operations: [{ id: "w1", name: "write", path: "owned.txt", mutation: true, status: "started" }],
+					droppedOperations: 0,
+					updatedAt: Date.now(),
+				});
+				options.onUsage({ ...emptyUsage(), output: 120, totalTokens: 120 }, undefined, id);
+				options.signal.throwIfAborted();
+				return { output: "must not accept", usage: emptyUsage(), turns: 1 };
+			},
+		});
+		const started = await launch(harness);
+		await ready(harness, started.workflow.id);
+		const result = await call(harness, {
+			action: "result",
+			id: started.workflow.id,
+			agent_id: `${started.workflow.id}/agent-1`,
+		});
+		expect(result.details).toMatchObject({
+			workflow: {
+				outcome: "failed",
+				agent: {
+					progress: {
+						partial: true,
+						output: "finding retained before cancel",
+						operations: [{ mutation: true, status: "unknown" }],
+					},
+				},
+			},
+		});
+	});
+
+	it("cancels on actual plus outstanding overcommit before reported actual alone exceeds the limit", async () => {
+		const { harness, executions } = await setup({ limits: { maxTotalTokens: 1000 } }, undefined, {
+			...mockEstimate,
+			estimatedInputTokens: 399,
+		});
+		const started = await launch(harness, "return await parallel([()=>agent('one'),()=>agent('two')]);");
+		await vi.waitFor(() => expect(executions).toHaveLength(2));
+		executions[0].complete("actual exceeded estimate", 700);
+		await ready(harness, started.workflow.id);
+		expect(executions[1].options.signal.aborted).toBe(true);
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8"))).toMatchObject({
+			outcome: "failed",
+			budget: {
+				usage: { totalTokens: 700 },
+				reservedTokens: 400,
+				unknownTokens: 400,
+				overspentTokens: 0,
+				overcommittedTokens: 100,
+			},
+			agents: [{ requests: [{ underestimatedTokens: 300 }] }, { requests: [{ status: "unknown" }] }],
+		});
+	});
+
+	it("rechecks pause after a competing request settles and releases admission balance", async () => {
+		const { harness, executions } = await setup({ limits: { maxTotalTokens: 100 } }, undefined, {
+			...mockEstimate,
+			estimatedInputTokens: 69,
+		});
+		const started = await launch(harness, "return await parallel([()=>agent('one'),()=>agent('two')]);");
+		await vi.waitFor(() => expect(JSON.parse(readFileSync(started.resultPath, "utf8")).agents).toHaveLength(2));
+		await harness.session.prompt(`/workflow pause ${started.workflow.id}`);
+		executions[0].complete("released balance", 10);
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		expect(executions).toHaveLength(1);
+		await harness.session.prompt(`/workflow resume ${started.workflow.id}`);
+		await vi.waitFor(() => expect(executions).toHaveLength(2));
+		executions[1].complete("done", 10);
+		await ready(harness, started.workflow.id);
+	});
+
+	it("requires explicit IDs for late observations instead of assigning them to the newest request", async () => {
+		const { harness } = await setup({
+			runChild: async (options) => {
+				const first = await options.beforeRequest(mockEstimate);
+				options.onRequestDispatched?.(first);
+				options.onUsage(emptyUsage(), undefined, first);
+				const second = await options.beforeRequest(mockEstimate);
+				options.onRequestDispatched?.(second);
+				const late = { ...emptyUsage(), input: 20, totalTokens: 20 };
+				expect(() => Reflect.apply(options.onUsage, undefined, [late])).toThrow("admitted request ID");
+				options.onUsage(late, undefined, first);
+				options.onUsage(late, undefined, first);
+				expect(() => options.onUsage({ ...late, totalTokens: 21 }, undefined, first)).toThrow("Conflicting usage");
+				options.onUsage(emptyUsage(), { reported: true }, second);
+				return { output: "correct request attribution", usage: late, turns: 2 };
+			},
+		});
+		const started = await launch(harness);
+		await ready(harness, started.workflow.id);
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8"))).toMatchObject({
+			outcome: "completed",
+			usage: { totalTokens: 20 },
+			agents: [
+				{
+					requests: [
+						{ status: "reported", usage: { totalTokens: 20 } },
+						{ status: "reported", usage: { totalTokens: 0 } },
+					],
+				},
+			],
+		});
+	});
+
+	it("late usage preserves read/archive ownership and exposes corrections without billing twice", async () => {
+		const { harness, executions } = await setup();
+		const started = await launch(harness);
+		await vi.waitFor(() => expect(executions).toHaveLength(1));
+		executions[0].complete("ready but metrics unknown", 0);
+		await ready(harness, started.workflow.id);
+		const initial = await call(harness, { action: "result", id: started.workflow.id });
+		expect(initial.usage?.totalTokens).toBe(0);
+		expect(initial.details).toMatchObject({
+			usageObservation: { completeness: "partial", unknownRequests: 1, returnedToParentTokens: 0 },
+		});
+		await call(harness, {
+			action: "acknowledge",
+			id: started.workflow.id,
+			summary: "Processed known partial accounting",
+		});
+		executions[0].options.onUsage(
+			{ ...emptyUsage(), input: 12, totalTokens: 12 },
+			undefined,
+			executions[0].requestId,
+		);
+		const late = await call(harness, { action: "result", id: started.workflow.id });
+		expect(late.usage).toBeUndefined();
+		expect(late.details).toMatchObject({
+			workflow: { status: "archived", usage: { totalTokens: 12 } },
+			usageObservation: {
+				completeness: "complete",
+				unknownRequests: 0,
+				returnedToParentTokens: 0,
+				lateReportedTokens: 12,
+			},
+		});
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8"))).toMatchObject({
+			status: "archived",
+			resultRead: true,
+			usageReported: true,
+			acknowledgement: "Processed known partial accounting",
+		});
+		expect((await call(harness, { action: "list" })).details).toEqual({ workflows: [] });
+	});
+
+	it("exposes child and script output truncation instead of implying complete delivery", async () => {
+		const { harness, executions } = await setup();
+		const started = await launch(
+			harness,
+			"const child=await agent('one'); if(!child.outputTruncated) throw Error('missing flag'); return 'x'.repeat(70000);",
+		);
+		await vi.waitFor(() => expect(executions).toHaveLength(1));
+		executions[0].complete("x".repeat(17000));
+		await ready(harness, started.workflow.id);
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8"))).toMatchObject({
+			outcome: "completed",
+			deliveryComplete: false,
+			resultTruncated: true,
+			agents: [{ outputTruncated: true, outputOriginalLength: 17000 }],
+		});
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8")).resultOriginalLength).toBeUndefined(); // Codemode already truncated; no invented original length.
+		const result = await call(harness, { action: "result", id: started.workflow.id });
+		expect(result.details).toMatchObject({
+			workflow: { deliveryComplete: false, resultTruncated: true, agents: [{ outputTruncated: true }] },
+		});
+	});
+
+	it("script success with a caught child failure is not a complete delivery", async () => {
+		const { harness } = await setup({
+			runChild: async () => {
+				throw new Error("child failed locally");
+			},
+		});
+		const started = await launch(harness, "try { await agent('one'); } catch {} return 'script returned';");
+		await ready(harness, started.workflow.id);
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8"))).toMatchObject({
+			outcome: "completed",
+			deliveryComplete: false,
+			agents: [{ status: "failed" }],
+		});
+	});
+
+	it("real child checkpoints its response before reported usage triggers cancellation", async () => {
+		const { harness, release } = await actualSetup({ limits: { maxTotalTokens: 10000, maxOutputTokens: 100 } });
+		const started = await launch(harness);
+		// Faux recomputes usage and does not enforce maxTokens. Use its real estimated
+		// output count to model provider overshoot; setting response.usage is overwritten.
+		harness.setResponses([
+			fauxAssistantMessage(`partial facts before token stop\n${"x".repeat(48000)}\nretained tail`),
+		]);
+		release();
+		await ready(harness, started.workflow.id);
+		const record = JSON.parse(readFileSync(started.resultPath, "utf8"));
+		expect(record).toMatchObject({
+			outcome: "failed",
+			agents: [{ turns: 1, progress: { partial: true, outputTruncated: true } }],
+		});
+		expect(record.usage.totalTokens).toBeGreaterThan(10000);
+		expect(record.agents[0].requests[0].reservedTokens).toBeLessThanOrEqual(10000);
+		expect(record.agents[0].progress.output).toMatch(/^partial facts before token stop/);
+		expect(record.agents[0].progress.output).toMatch(/retained tail$/);
+		expect(record.agents[0].progress.output.length).toBeLessThanOrEqual(8192);
 	});
 
 	it("keeps results active until retrieval and explicit processing acknowledgement; retains history", async () => {
@@ -428,6 +765,15 @@ describe("independent Workflow (QuickJS and faux/local runners only)", () => {
 		const { harness, executions } = await setup();
 		const started = await launch(harness);
 		await vi.waitFor(() => expect(executions).toHaveLength(1));
+		executions[0].options.onProgress?.({
+			partial: true,
+			output: "saved observation",
+			outputTruncated: false,
+			operations: [{ id: "w1", name: "write", mutation: true, status: "started" }],
+			droppedOperations: 0,
+			updatedAt: Date.now(),
+		});
+		const before = JSON.parse(readFileSync(started.resultPath, "utf8"));
 		const restored = new WorkflowManager({
 			storageRoot: dirname(dirname(started.logPath)),
 			sessionId: harness.sessionManager.getSessionId(),
@@ -436,7 +782,21 @@ describe("independent Workflow (QuickJS and faux/local runners only)", () => {
 		expect(restored.get(started.workflow.id)).toMatchObject({
 			status: "awaiting_result",
 			outcome: "unknown",
-			agents: [{ requests: [{ status: "unknown" }] }],
+			budget: {
+				reservedTokens: before.budget.reservedTokens,
+				unknownTokens: before.budget.reservedTokens,
+				availableTokens: before.budget.availableTokens,
+				usage: before.budget.usage,
+				phases: [{ unknownTokens: 1, reservedTokens: 1 }],
+				agents: [{ unknownTokens: 1, reservedTokens: 1 }],
+			},
+			agents: [
+				{
+					requests: [{ status: "unknown" }],
+					budget: { unknownTokens: 1, reservedTokens: 1 },
+					progress: { output: "saved observation", operations: [{ status: "unknown" }] },
+				},
+			],
 		});
 		expect(() => restored.resume(started.workflow.id)).toThrow("never restarted");
 		await expect(restored.stop(started.workflow.id)).rejects.toThrow("previous runtime");

@@ -20,13 +20,26 @@ export function createScriptRunner(pi: ExtensionAPI): ScriptRunner {
 	createCodemodeExtension({ mode: "on", models: false })(registration);
 	const tool = definition;
 	if (!tool) throw new Error("Host did not register the codemode runtime");
-	return (code, ctx, signal) => tool.execute("workflow-script", { code }, signal, undefined, ctx);
+	return async (code, ctx, signal) => {
+		const result = await tool.execute("workflow-script", { code }, signal, undefined, ctx);
+		const details = result.details;
+		// Codemode exposes a spill path, but no truncation flag on failed spill. Its
+		// warning is a conservative fallback: a script quoting it may be marked partial,
+		// never the reverse. Do not invent the original length of upstream-truncated text.
+		const outputTruncated =
+			(typeof details === "object" &&
+				details !== null &&
+				"fullOutputPath" in details &&
+				typeof details.fullOutputPath === "string") ||
+			result.content.some((part) => part.type === "text" && part.text.startsWith("Warning: truncated output ("));
+		return { ...result, outputTruncated };
+	};
 }
 
 /** Helpers live inside QuickJS. The only host capabilities are the two validated bridge tools. */
 export const prelude = `
 const agent = (prompt, options = {}) => tools.workflow_agent({prompt, ...options});
-const phase = (title) => tools.workflow_control({action: "phase", text: title});
+const phase = (title, options = {}) => tools.workflow_control({...options, action: "phase", text: title});
 const log = (message) => tools.workflow_control({action: "log", text: String(message)});
 const checkpoint = () => tools.workflow_control({action: "checkpoint"});
 async function parallel(tasks) {

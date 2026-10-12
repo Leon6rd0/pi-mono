@@ -11,96 +11,31 @@ import {
 } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import type { AgentTool, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { type JsonValue, StringEnum, type Usage } from "@earendil-works/pi-ai";
+import type { JsonValue, Usage } from "@earendil-works/pi-ai";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Check } from "typebox/value";
 import { safeText } from "../task-monitor/manager.ts";
-import { normalizeWorkflowUsage } from "./budget.ts";
+import { BudgetAdmissionError, normalizeWorkflowUsage, WorkflowBudgetLedger } from "./budget.ts";
 import { clampWorkflowThinkingLevel } from "./effort.ts";
+import { controlSchema, progressSchema, recordSchema, requestEstimateSchema } from "./records.ts";
 import { prelude } from "./script.ts";
 import {
 	type AgentRecord,
-	addUsage,
 	agentSchema,
 	type ChildRunner,
 	defaultLimits,
 	emptyUsage,
+	type ModelRequestEstimate,
 	type ModelRequestRecord,
 	type ScriptRunner,
-	thinkingSchema,
 	type WorkflowLimits,
 	type WorkflowRecord,
 } from "./types.ts";
 
-const number = Type.Number({ minimum: 0 });
-const usageSchema = Type.Object({
-	input: number,
-	output: number,
-	cacheRead: number,
-	cacheWrite: number,
-	totalTokens: number,
-	cost: Type.Object({ input: number, output: number, cacheRead: number, cacheWrite: number, total: number }),
-});
-const recordSchema = Type.Object({
-	id: Type.String({ pattern: "^workflow-[a-f0-9-]{36}$" }),
-	label: Type.String({ maxLength: 500 }),
-	cwd: Type.String(),
-	provider: Type.String(),
-	model: Type.String(),
-	thinkingLevel: Type.Optional(thinkingSchema),
-	status: StringEnum(["running", "paused", "awaiting_result", "archived"] as const),
-	outcome: Type.Optional(StringEnum(["completed", "failed", "stopped", "unknown"] as const)),
-	phase: Type.String({ maxLength: 500 }),
-	agents: Type.Array(
-		Type.Object({
-			id: Type.String(),
-			role: StringEnum(["scout", "worker", "reviewer", "summarizer"] as const),
-			label: Type.String({ maxLength: 200 }),
-			phase: Type.String({ maxLength: 500 }),
-			status: StringEnum(["queued", "running", "completed", "failed", "stopped"] as const),
-			output: Type.Optional(Type.String({ maxLength: 16384 })),
-			error: Type.Optional(Type.String({ maxLength: 2000 })),
-			turns: Type.Optional(number),
-			usage: Type.Optional(usageSchema),
-			requests: Type.Optional(
-				Type.Array(
-					Type.Object({
-						id: Type.String(),
-						status: StringEnum(["in_flight", "reported", "unknown"] as const),
-						source: StringEnum(["request_gate", "usage_only"] as const),
-						startedAt: Type.Optional(number),
-						dispatchedAt: Type.Optional(number),
-						reportedAt: Type.Optional(number),
-						usage: Type.Optional(usageSchema),
-					}),
-					{ maxItems: 64 },
-				),
-			),
-			thinkingLevel: Type.Optional(thinkingSchema),
-		}),
-		{ maxItems: 32 },
-	),
-	usage: usageSchema,
-	createdAt: number,
-	updatedAt: number,
-	result: Type.Optional(Type.String({ maxLength: 65536 })),
-	error: Type.Optional(Type.String({ maxLength: 2000 })),
-	resultRead: Type.Optional(Type.Boolean()),
-	usageReported: Type.Optional(Type.Boolean()),
-	acknowledgedAt: Type.Optional(number),
-	acknowledgement: Type.Optional(Type.String({ maxLength: 1000 })),
-});
-const controlSchema = Type.Object(
-	{
-		action: StringEnum(["phase", "log", "checkpoint"] as const),
-		text: Type.Optional(Type.String({ maxLength: 500 })),
-	},
-	{ additionalProperties: false },
-);
-
 interface Runtime {
 	controller: AbortController;
+	budget: WorkflowBudgetLedger;
 	done: Promise<void>;
 	wake: Set<() => void>;
 	children: Set<Promise<unknown>>;
@@ -171,7 +106,27 @@ export class WorkflowManager {
 					record.outcome = "unknown";
 					record.error =
 						"Previous runtime ended without a confirmed result. Nothing is automatically resumed or restarted.";
+					if (record.budget) {
+						for (const request of record.budget.requests)
+							if (request.status === "reserved" || request.status === "dispatched") request.status = "unknown";
+						const unknown = record.budget.requests.filter((request) => request.status === "unknown");
+						record.budget.unknownTokens = unknown.reduce((sum, request) => sum + request.reservedTokens, 0);
+						for (const scope of record.budget.agents)
+							scope.unknownTokens = unknown
+								.filter((request) => request.agentId === scope.id)
+								.reduce((sum, request) => sum + request.reservedTokens, 0);
+						for (const scope of record.budget.phases)
+							scope.unknownTokens = unknown
+								.filter((request) => request.phaseId === scope.id)
+								.reduce((sum, request) => sum + request.reservedTokens, 0);
+					}
 					for (const agent of record.agents) {
+						if (agent.budget)
+							agent.budget.unknownTokens =
+								record.budget?.agents.find((scope) => scope.id === agent.id)?.unknownTokens ??
+								agent.budget.reservedTokens;
+						for (const operation of agent.progress?.operations ?? [])
+							if (operation.status === "started") operation.status = "unknown";
 						for (const request of agent.requests ?? [])
 							if (request.status === "in_flight") request.status = "unknown";
 						if (agent.status === "running" || agent.status === "queued") {
@@ -192,10 +147,13 @@ export class WorkflowManager {
 			.filter((record) => includeArchived || record.status !== "archived")
 			.map((record) => structuredClone(record));
 	}
-	get(id: string): WorkflowRecord {
+	private requireRecord(id: string): WorkflowRecord {
 		const record = this.records.get(id);
 		if (!record) throw new Error(`Unknown workflow: ${id}`);
-		return structuredClone(record);
+		return record;
+	}
+	get(id: string): WorkflowRecord {
+		return structuredClone(this.requireRecord(id));
 	}
 	logPath(id: string): string {
 		if (!/^workflow-[a-f0-9-]{36}$/.test(id)) throw new Error("Invalid workflow ID");
@@ -253,7 +211,92 @@ export class WorkflowManager {
 		signal.throwIfAborted();
 		while (record.status === "paused") await this.wait(runtime, signal);
 		signal.throwIfAborted();
-		if (record.usage.totalTokens >= this.limits.maxTotalTokens) throw new Error("Workflow token budget exhausted");
+	}
+
+	private syncBudget(record: WorkflowRecord, runtime: Runtime): void {
+		const snapshot = runtime.budget.snapshot();
+		record.budget = snapshot;
+		record.usage = structuredClone(snapshot.usage);
+		for (const agent of record.agents) {
+			const scope = snapshot.agents.find((scope) => scope.id === agent.id);
+			if (scope) {
+				const { id: _id, ...totals } = scope;
+				agent.budget = totals;
+				agent.usage = structuredClone(scope.usage);
+			}
+		}
+	}
+
+	private async admitRequest(
+		record: WorkflowRecord,
+		runtime: Runtime,
+		agent: AgentRecord,
+		estimate: ModelRequestEstimate,
+		signal: AbortSignal,
+	): Promise<ModelRequestRecord> {
+		if (!Check(requestEstimateSchema, estimate) || estimate.maxOutputTokens > this.limits.maxOutputTokens)
+			throw new Error("Child request requires a valid bounded estimate before admission");
+		const requests = agent.requests!;
+		if (requests.some((request) => request.status === "in_flight"))
+			throw new Error("Overlapping child model requests are unsupported");
+		if (requests.length >= this.limits.maxTurns) throw new Error("Child request accounting limit reached");
+		const id = `${agent.id}/request-${requests.length + 1}`;
+		while (true) {
+			await this.gate(record, runtime, signal);
+			// The await above may yield to pause/stop/settlement: recheck before atomic reservation.
+			signal.throwIfAborted();
+			if (record.status === "paused") continue;
+			try {
+				const reservation = runtime.budget.reserve({
+					id,
+					agentId: agent.id,
+					phaseId: agent.phaseId!,
+					estimatedInputTokens: estimate.estimatedInputTokens,
+					maxOutputTokens: estimate.maxOutputTokens,
+					marginTokens: estimate.marginTokens,
+				});
+				const request: ModelRequestRecord = {
+					id,
+					status: "in_flight",
+					source: "request_gate",
+					startedAt: Date.now(),
+					estimate: structuredClone(estimate),
+					reservedTokens: reservation.reservedTokens,
+				};
+				requests.push(request);
+				this.syncBudget(record, runtime);
+				this.save(record);
+				return request;
+			} catch (error) {
+				if (!(error instanceof BudgetAdmissionError)) throw error;
+				const snapshot = runtime.budget.snapshot();
+				const scope =
+					error.scope === "workflow"
+						? snapshot
+						: (error.scope === "agent" ? snapshot.agents : snapshot.phases).find(
+								(scope) => scope.id === error.scopeId,
+							)!;
+				const pending = snapshot.requests.some(
+					(request) =>
+						(request.status === "reserved" || request.status === "dispatched") &&
+						(error.scope === "workflow" ||
+							(error.scope === "agent" ? request.agentId : request.phaseId) === error.scopeId),
+				);
+				// Await real settlements only when they could make this request fit; unknown usage never spins/waits forever.
+				if (pending && error.requestedTokens <= scope.limit - scope.usage.totalTokens - scope.unknownTokens) {
+					await this.wait(runtime, signal);
+					continue;
+				}
+				runtime.failure = {
+					outcome: "failed",
+					message: `Workflow token budget exhausted at ${error.scope} admission: ${error.message}`,
+				};
+				this.syncBudget(record, runtime);
+				this.save(record);
+				runtime.controller.abort(new Error(runtime.failure.message));
+				throw error;
+			}
+		}
 	}
 
 	start(options: StartWorkflow): WorkflowRecord {
@@ -282,6 +325,8 @@ export class WorkflowManager {
 		);
 		const args = JSON.stringify(options.args ?? {});
 		if (args.length > 32768) throw new Error("Workflow args exceed 32768 characters");
+		const budget = new WorkflowBudgetLedger(this.limits.maxTotalTokens);
+		budget.defineScope("phase", "phase-1", this.limits.maxTotalTokens);
 		const record: WorkflowRecord = {
 			id: `workflow-${randomUUID()}`,
 			label: options.label,
@@ -291,6 +336,9 @@ export class WorkflowManager {
 			thinkingLevel,
 			status: "running",
 			phase: "Start",
+			phaseId: "phase-1",
+			phases: [{ id: "phase-1", title: "Start" }],
+			budget: budget.snapshot(),
 			agents: [],
 			usage: emptyUsage(),
 			createdAt: Date.now(),
@@ -301,6 +349,7 @@ export class WorkflowManager {
 		this.save(record);
 		const runtime: Runtime = {
 			controller: new AbortController(),
+			budget,
 			done: Promise.resolve(),
 			wake: new Set(),
 			children: new Set(),
@@ -332,33 +381,25 @@ export class WorkflowManager {
 						role: input.role ?? "worker",
 						label: input.label ?? input.role ?? "worker",
 						phase: record.phase,
+						phaseId: record.phaseId,
 						status: "queued",
 						turns: 0,
 						usage: emptyUsage(),
 						requests: [],
 						thinkingLevel: childThinkingLevel,
 					};
+					budget.defineScope("agent", agent.id, input.maxTotalTokens ?? this.limits.maxTotalTokens);
 					record.agents.push(agent);
+					this.syncBudget(record, runtime);
 					this.save(record);
 					const requests = agent.requests!;
-					let currentRequest: ModelRequestRecord | undefined;
-					const newRequest = (source: ModelRequestRecord["source"]): ModelRequestRecord => {
-						if (requests.length >= this.limits.maxTurns)
-							throw new Error("Child request accounting limit reached");
-						const request: ModelRequestRecord = {
-							id: `${agent.id}/request-${requests.length + 1}`,
-							status: source === "request_gate" ? "in_flight" : "unknown",
-							source,
-							...(source === "request_gate" ? { startedAt: Date.now() } : {}),
-						};
-						requests.push(request);
-						return request;
-					};
 					const execution = (async () => {
 						let acquired = false;
 						try {
 							while (true) {
 								await this.gate(record, runtime, signal);
+								signal.throwIfAborted();
+								if (record.status === "paused") continue;
 								if (runtime.active < this.limits.concurrency) {
 									runtime.active++;
 									acquired = true;
@@ -378,49 +419,68 @@ export class WorkflowManager {
 								maxTurns: this.limits.maxTurns,
 								maxOutputTokens: this.limits.maxOutputTokens,
 								signal,
-								beforeRequest: async () => {
-									await this.gate(record, runtime, signal);
-									if (currentRequest?.status === "in_flight")
-										throw new Error("Overlapping child model requests are unsupported");
-									currentRequest = newRequest("request_gate");
-									this.save(record);
-								},
-								onRequestDispatched: () => {
-									if (
-										!currentRequest ||
-										currentRequest.status !== "in_flight" ||
-										currentRequest.dispatchedAt !== undefined
-									)
+								beforeRequest: async (estimate) =>
+									(await this.admitRequest(record, runtime, agent, estimate, signal)).id,
+								onRequestDispatched: (requestId) => {
+									signal.throwIfAborted();
+									const request = requests.find((item) => item.id === requestId);
+									if (!request || request.status !== "in_flight" || request.dispatchedAt !== undefined)
 										throw new Error("Invalid child request dispatch observation");
-									currentRequest.dispatchedAt = Date.now();
+									budget.markDispatched(requestId);
+									request.dispatchedAt = Date.now();
 									agent.turns = (agent.turns ?? 0) + 1;
+									this.syncBudget(record, runtime);
 									this.save(record);
 								},
-								onUsage: (source, observation) => {
+								onProgress: (progress) => {
+									if (!Check(progressSchema, progress)) throw new Error("Invalid bounded child checkpoint");
+									agent.progress = structuredClone(progress);
+									this.save(record);
+								},
+								onUsage: (source, observation, requestId) => {
+									const request = requests.find((item) => item.id === requestId);
+									if (!request) throw new Error("Child usage requires an admitted request ID");
 									const usage = normalizeWorkflowUsage(source);
-									const request = currentRequest ?? newRequest("usage_only");
+									const settlement = budget.settle(request.id, usage, observation);
 									request.usage = usage;
-									request.reportedAt = Date.now();
-									request.status = (observation?.reported ?? usage.totalTokens > 0) ? "reported" : "unknown";
-									currentRequest = undefined;
-									addUsage(agent.usage!, usage);
-									addUsage(record.usage, usage);
-									if (record.usage.totalTokens >= this.limits.maxTotalTokens) {
+									request.reportedAt ??= Date.now();
+									request.status = settlement.unknown ? "unknown" : "reported";
+									if (!settlement.unknown)
+										request.underestimatedTokens = Math.max(0, usage.totalTokens - request.reservedTokens!);
+									this.syncBudget(record, runtime);
+									this.save(record); // Retain observations/accounting before cancellation.
+									this.wake(runtime);
+									const snapshot = record.budget!;
+									if (
+										this.running.has(record.id) &&
+										((snapshot.overcommittedTokens ?? 0) > 0 ||
+											snapshot.agents.some((scope) => (scope.overcommittedTokens ?? 0) > 0) ||
+											snapshot.phases.some((scope) => (scope.overcommittedTokens ?? 0) > 0))
+									) {
 										runtime.failure = {
 											outcome: "failed",
-											message: "Workflow token budget exhausted; in-flight usage may exceed the budget",
+											message:
+												"Workflow token budget exhausted; reported usage plus outstanding reservations exceeds a scope limit",
 										};
 										runtime.controller.abort(new Error(runtime.failure.message));
 									}
-									this.save(record);
 								},
 							});
 							signal.throwIfAborted();
 							agent.status = "completed";
 							agent.output = result.output.slice(0, 16384);
+							agent.outputOriginalLength = Math.max(result.outputOriginalLength ?? 0, result.output.length);
+							agent.outputTruncated =
+								result.outputTruncated === true || agent.outputOriginalLength > agent.output.length;
 							if (!requests.some((request) => request.dispatchedAt !== undefined)) agent.turns = result.turns;
 							this.log(record, runtime, `Agent completed: ${agent.id}`);
-							const value: JsonValue = { id: agent.id, role: agent.role, output: agent.output };
+							const value: JsonValue = {
+								id: agent.id,
+								role: agent.role,
+								output: agent.output,
+								outputTruncated: agent.outputTruncated,
+								outputOriginalLength: agent.outputOriginalLength,
+							};
 							return {
 								content: [{ type: "text" as const, text: JSON.stringify(value) }],
 								details: value,
@@ -431,7 +491,18 @@ export class WorkflowManager {
 							agent.error = String(error).slice(0, 2000);
 							throw error;
 						} finally {
-							if (currentRequest?.status === "in_flight") currentRequest.status = "unknown";
+							for (const request of requests.filter((item) => item.status === "in_flight")) {
+								if (request.dispatchedAt === undefined) {
+									budget.releaseUnsent(request.id);
+									request.status = "not_sent";
+								} else {
+									budget.markUnknown(request.id);
+									request.status = "unknown";
+								}
+							}
+							for (const operation of agent.progress?.operations ?? [])
+								if (operation.status === "started") operation.status = "unknown";
+							this.syncBudget(record, runtime);
 							if (acquired) runtime.active--;
 							this.wake(runtime);
 							this.save(record);
@@ -459,9 +530,16 @@ export class WorkflowManager {
 					if (input.action !== "checkpoint") {
 						if (!input.text?.trim()) throw new Error("phase/log requires text");
 						if (input.action === "phase") {
+							if (record.phases!.length >= 1024) throw new Error("Workflow phase record limit reached");
+							const phaseId = `phase-${record.phases!.length + 1}`;
+							budget.defineScope("phase", phaseId, input.maxTotalTokens ?? this.limits.maxTotalTokens);
 							record.phase = input.text;
+							record.phaseId = phaseId;
+							record.phases!.push({ id: phaseId, title: input.text });
+							this.syncBudget(record, runtime);
 							this.save(record);
-						}
+						} else if (input.maxTotalTokens !== undefined)
+							throw new Error("Only phases accept a token allocation");
 						this.log(record, runtime, `${input.action}: ${input.text}`);
 					}
 					return { content: [{ type: "text", text: "ok" }], details: undefined };
@@ -510,11 +588,13 @@ export class WorkflowManager {
 						context,
 						runtime.controller.signal,
 					);
-					record.result = result.content
+					const text = result.content
 						.filter((part) => part.type === "text")
 						.map((part) => part.text)
-						.join("\n")
-						.slice(0, 65536);
+						.join("\n");
+					record.result = text.slice(0, 65536);
+					record.resultOriginalLength = result.outputTruncated ? undefined : text.length;
+					record.resultTruncated = result.outputTruncated === true || text.length > 65536;
 					record.outcome = result.isError ? "failed" : "completed";
 				} catch (error) {
 					record.outcome = "failed";
@@ -528,6 +608,10 @@ export class WorkflowManager {
 						record.outcome = runtime.failure.outcome;
 						record.error = runtime.failure.message;
 					}
+					record.deliveryComplete =
+						record.outcome === "completed" &&
+						!record.resultTruncated &&
+						record.agents.every((agent) => agent.status === "completed" && !agent.outputTruncated);
 					record.status = "awaiting_result";
 					this.running.delete(record.id);
 					try {
@@ -592,21 +676,25 @@ export class WorkflowManager {
 		return this.get(id);
 	}
 	result(id: string, reportUsage = true): { workflow: WorkflowRecord; usage?: Usage } {
-		const record = this.get(id);
+		// Preserve the object owned by late callbacks; never replace it with a public clone.
+		const record = this.requireRecord(id);
 		if (record.status !== "awaiting_result" && record.status !== "archived")
 			throw new Error("Workflow result is not ready; do not wait or poll");
 		const usage = reportUsage && !record.usageReported ? structuredClone(record.usage) : undefined;
 		record.resultRead = true;
-		if (reportUsage) record.usageReported = true;
+		if (reportUsage && !record.usageReported) {
+			record.usageReported = true;
+			record.usageReportedTokens = record.usage.totalTokens;
+		}
 		this.save(record);
 		return { workflow: this.get(id), usage };
 	}
 	acknowledge(id: string, summary: string): WorkflowRecord {
 		if (this.closing) throw new Error("Workflow runtime is shutting down");
-		const record = this.get(id);
+		const record = this.requireRecord(id);
 		if (!summary.trim() || summary.length > 1000)
 			throw new Error("acknowledge requires a 1–1000 character processing summary");
-		if (record.status === "archived") return record;
+		if (record.status === "archived") return this.get(id);
 		if (record.status !== "awaiting_result" || !record.resultRead)
 			throw new Error("Read the ready result with workflow result, process it, then acknowledge");
 		record.status = "archived";

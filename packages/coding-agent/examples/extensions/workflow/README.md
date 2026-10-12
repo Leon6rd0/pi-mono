@@ -121,14 +121,17 @@ Model tool arguments:
 
 Supported subset:
 
-- `await agent(prompt, {role?, label?, effort?})` → `{id, role, output}`. A failed child
+- `await agent(prompt, {role?, label?, effort?, maxTotalTokens?})` → `{id, role, output, outputTruncated, outputOriginalLength}`. A failed child
   rejects; scripts may explicitly catch ordinary child failures. This differs
   from Claude's null-result behavior. There are no automatic child restarts.
 - `await parallel([()=>agent(...), ...])` runs functions (or prompt strings)
   concurrently; host admission enforces the configured child limit.
 - `await pipeline(items, mapper, {concurrency?: 1..4})` maps items with bounded
   concurrency and preserves input order. Serial stages use ordinary `await`.
-- `await phase(title)`, `await log(message)` update local progress/logs.
+- `await phase(title, {maxTotalTokens?})`, `await log(message)` update local progress/logs.
+  Optional phase/child token allocations narrow the configured workflow limit; they
+  cannot raise it. Every phase has a distinct ID, including repeated titles. Children
+  keep the phase they were created in, even if a later phase begins before usage arrives.
 - `await checkpoint()` waits if paused. Every new child and model request also
   passes a pause checkpoint.
 - `args` contains JSON launch input. Top-level `await` and `return` are supported.
@@ -216,25 +219,33 @@ observation. Queue counts and recent results are bounded summaries, not full his
 bounded `requests` with input/output/cache-read/cache-write/total/cost fields.
 Use the returned persisted metadata path when the human-readable response is truncated.
 
-Request observations are `in_flight`, `reported`, or `unknown`. `reported` means
+Request observations are `in_flight`, `reported`, `unknown`, or `not_sent`. The last
+means admission was released before provider handoff, not a cancelled remote call. `reported` means
 usage was received; it does not claim the response or task succeeded. Requests
 interrupted without usage, including after reload, stay unknown, not zero-cost.
 Missing historical per-child data is unavailable, not a reconstructed zero. A
 trusted runner can explicitly assert a complete genuine zero with
-`onUsage(usage, {reported: true})`; unmarked all-zero native usage remains unknown
+`onUsage(usage, {reported: true}, requestId)`; unmarked all-zero native usage remains unknown
 because the current provider message contract cannot distinguish omitted/default
-metrics from supplied zero metrics. `onRequestDispatched()` persists a provider
+metrics from supplied zero metrics. `onRequestDispatched(requestId)` persists a provider
 handoff attempt, including on failure/stop; it does not prove server acceptance.
-A trusted host runner that supplies usage without a request gate is labeled
-`usage_only`, with no fabricated request start time.
+New host runner overrides must await `beforeRequest(estimate)`, use its returned
+request ID for `onRequestDispatched(id)` and `onUsage(usage, observationOrUndefined, id)`, and
+implement cancellation/drain. Historical `usage_only` records remain readable,
+but new unadmitted usage is rejected; arbitrary trusted host network code is not sandboxed.
 
 Providers commonly publish usage only at response completion. The display updates
 on local gates/usage events; it does not poll or pretend to have live billed-token
-counts for an in-flight response. Estimated admission reservations will be a
-separate display once the budget ledger is connected to runtime admission; the
-standalone ledger does not yet change the response-completion budget boundary below.
+counts for an in-flight response. Outstanding reservations, their unknown subset,
+and remaining admission balance are displayed separately as **estimates**. Native
+request estimates include the exact normalized system/tool/replay context, usage
+hints, character estimates and a 20% input margin (at least 256 tokens), plus the
+output limit. This is not a provider tokenizer or a hard billing guarantee.
 Inspecting status does not add child usage to the main session again. The first
-ready tool-result retrieval still accounts it once.
+ready tool-result retrieval still accounts the known subtotal once. `usageObservation`
+accompanies it with completeness, unknown/in-flight counts and returned-to-parent tokens.
+Late corrections update retained accounting without overwriting read/archive state or
+billing the parent a second time; `lateReportedTokens` exposes that accounting gap.
 
 ## Limits and boundaries
 
@@ -246,11 +257,34 @@ ready tool-result retrieval still accounts it once.
 - 2 MiB progress log, 16 Ki characters/child output, 64 Ki characters/script result;
   model-facing tool text capped at 32 Ki characters. Full retained metadata path
   is returned, and individual child results are queryable. Output beyond those
-  retention caps is not kept.
-- Token budget uses reported completed responses. In-flight requests can overshoot;
-  zero/missing usage and provider pricing are not a hard billing guarantee. Turn,
-  output and deadline limits remain independent safeguards. No automatic retries
-  or compaction calls are added by the child runtime.
+  retention caps is not kept by Workflow. `outputTruncated` / `resultTruncated` mark
+  incomplete output; original character lengths are retained when known. Codemode
+  may truncate/spill before Workflow receives a result; its original length is then
+  unavailable, not invented. A missing spill-path warning is conservatively detected
+  from the host's warning prefix (quoting that prefix can also mark a result partial).
+  `outcome: completed` means script success, not acceptance; `deliveryComplete` is
+  false for non-completed children or truncated output, including caught failures.
+- Token admission atomically reserves estimated input + margin + bounded output
+  after asynchronous pause/queue gates. Competing requests cannot spend the same
+  balance. If a real outstanding settlement could make a request fit, admission
+  waits locally on that event, not on polling/model timers. Permanently unaffordable
+  admission fails the workflow even if the script catches the bridge error.
+- Usage settles idempotently by request ID and original child/phase. Confirmed
+  unsent requests release their reservation; potentially dispatched missing/zero
+  usage remains unknown and keeps its debit, unless trustworthy late usage or an
+  explicit complete-zero observation arrives. Estimates can still understate
+  actual usage; overshoot is retained, not capped or erased. Per-request
+  `underestimatedTokens` records estimate error. Reported usage plus outstanding
+  reservations exceeding any scope stops further work (`overcommittedTokens`), even
+  before reported actual alone exceeds it (`overspentTokens`). Unknown reservations
+  are a subset of outstanding reservations, never a second debit or a refund on reload.
+  Turn/output/deadline safeguards remain independent. No retries or compaction calls are added.
+- Completed-message/tool checkpoints are persisted before usage can trigger a
+  budget cancellation. Agent `progress` is bounded **untrusted partial evidence**:
+  latest assistant text, tool paths/outcomes/excerpts and explicit truncation/drop
+  counts. It is not test PASS, verified file modification, rollback, full transcript,
+  or permission to retry/resume. Unresolved mutation attempts remain unknown after
+  stop/reload. Script summarization is not required to retrieve this checkpoint.
 - First model-tool `result` retrieval reports accumulated child usage to the main
   session once, including repeated retrievals after reload. `/workflow result`
   does not claim that accounting; command-only review keeps usage in Workflow
@@ -280,7 +314,8 @@ node ../../node_modules/vitest/dist/cli.js --run \
   test/thinking-selector.test.ts test/suite/workflow-mode.test.ts \
   test/suite/workflow.test.ts test/task-monitor-manager.test.ts \
   test/suite/task-monitor.test.ts test/workflow-budget.test.ts \
-  test/workflow-usage-view.test.ts
+  test/workflow-usage-view.test.ts test/workflow-request-context.test.ts \
+  test/workflow-progress.test.ts
 ```
 
 The tests use real QuickJS workers, controlled local child runners and the faux

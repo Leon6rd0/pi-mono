@@ -16,6 +16,7 @@ export interface RequestBudgetRecord extends RequestBudgetEstimate {
 	reservedTokens: number;
 	status: RequestBudgetStatus;
 	usage?: Usage;
+	underestimatedTokens?: number;
 }
 export interface BudgetTotals {
 	limit: number;
@@ -25,6 +26,8 @@ export interface BudgetTotals {
 	unknownTokens: number;
 	availableTokens: number;
 	overspentTokens: number;
+	/** Reported actual plus all outstanding estimates beyond the limit; old history may omit it. */
+	overcommittedTokens?: number;
 }
 export interface WorkflowBudgetSnapshot extends BudgetTotals {
 	agents: Array<BudgetTotals & { id: string }>;
@@ -140,6 +143,7 @@ export class WorkflowBudgetLedger {
 			unknownTokens,
 			availableTokens: Math.max(0, limit - usage.totalTokens - reservedTokens),
 			overspentTokens: Math.max(0, usage.totalTokens - limit),
+			overcommittedTokens: Math.max(0, usage.totalTokens + reservedTokens - limit),
 		};
 	}
 
@@ -224,7 +228,12 @@ export class WorkflowBudgetLedger {
 			this.markUnknown(id);
 			return { applied: false, unknown: true, exceeded: [] };
 		}
-		const replacement: RequestBudgetRecord = { ...record, status: "settled", usage };
+		const replacement: RequestBudgetRecord = {
+			...record,
+			status: "settled",
+			usage,
+			underestimatedTokens: Math.max(0, usage.totalTokens - record.reservedTokens),
+		};
 		const exceeded: BudgetScope[] = [];
 		for (const [scope, scopeId] of [
 			["workflow", ""],

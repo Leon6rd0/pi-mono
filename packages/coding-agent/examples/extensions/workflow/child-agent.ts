@@ -9,6 +9,8 @@ import {
 	type ModelRegistry,
 } from "@earendil-works/pi-coding-agent";
 import { clampWorkflowThinkingLevel } from "./effort.ts";
+import { ChildProgressTracker } from "./progress.ts";
+import { estimateWorkflowRequest } from "./request-context.ts";
 import { addUsage, type ChildRunner, emptyUsage } from "./types.ts";
 
 const roles = {
@@ -62,7 +64,8 @@ export function createChildRunner(registry: ModelRegistry, model: Model<string>)
 			},
 		}));
 		let turns = 0;
-		let awaitingUsage = false;
+		let awaitingUsageId: string | undefined;
+		const progress = new ChildProgressTracker();
 		const usage = emptyUsage();
 		const agent = new Agent({
 			initialState: {
@@ -76,25 +79,31 @@ export function createChildRunner(registry: ModelRegistry, model: Model<string>)
 			streamFn: async (selected, context, streamOptions) => {
 				options.signal.throwIfAborted();
 				if (turns >= options.maxTurns) throw new Error(`Child turn limit reached (${options.maxTurns})`);
-				await options.beforeRequest();
+				const maxTokens = Math.min(options.maxOutputTokens, selected.maxTokens || options.maxOutputTokens);
+				const requestId = await options.beforeRequest(
+					estimateWorkflowRequest(context, maxTokens, selected.contextWindow),
+				);
 				options.signal.throwIfAborted();
-				options.onRequestDispatched?.();
+				options.onRequestDispatched?.(requestId);
 				turns++;
-				awaitingUsage = true;
+				awaitingUsageId = requestId;
 				return registry.streamSimple(selected, context, {
 					...streamOptions,
 					maxRetries: 0,
-					maxTokens: Math.min(options.maxOutputTokens, selected.maxTokens || options.maxOutputTokens),
+					maxTokens,
 				});
 			},
 		});
 		const unsubscribe = agent.subscribe((event) => {
-			if (event.type === "message_end" && event.message.role === "assistant" && awaitingUsage) {
-				awaitingUsage = false;
+			// Save completed messages/tool observations before usage can trigger a budget abort.
+			if (progress.observe(event)) options.onProgress?.(progress.snapshot());
+			if (event.type === "message_end" && event.message.role === "assistant" && awaitingUsageId) {
+				const requestId = awaitingUsageId;
+				awaitingUsageId = undefined;
 				addUsage(usage, event.message.usage);
 				// Native messages currently cannot prove whether an all-zero usage was supplied
 				// by the provider or synthesized/defaulted. Keep it unknown unless a host can assert it.
-				options.onUsage(event.message.usage);
+				options.onUsage(event.message.usage, undefined, requestId);
 			}
 		});
 		const abort = () => agent.abort();
@@ -114,10 +123,17 @@ export function createChildRunner(registry: ModelRegistry, model: Model<string>)
 				.filter((part) => part.type === "text")
 				.map((part) => part.text)
 				.join("\n");
-			return { output: output.slice(0, 16384), usage, turns };
+			return {
+				output: output.slice(0, 16384),
+				outputTruncated: output.length > 16384,
+				outputOriginalLength: output.length,
+				usage,
+				turns,
+			};
 		} finally {
 			agent.abort();
 			await agent.waitForIdle();
+			if (progress.interrupt()) options.onProgress?.(progress.snapshot());
 			options.signal.removeEventListener("abort", abort);
 			unsubscribe();
 		}

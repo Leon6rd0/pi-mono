@@ -3,6 +3,7 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
+import type { BudgetTotals, WorkflowBudgetSnapshot } from "./budget.ts";
 
 export const workflowThinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export const thinkingSchema = StringEnum(workflowThinkingLevels);
@@ -13,6 +14,7 @@ export const agentSchema = Type.Object(
 		role: Type.Optional(StringEnum(["scout", "worker", "reviewer", "summarizer"] as const)),
 		label: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
 		effort: Type.Optional(thinkingSchema),
+		maxTotalTokens: Type.Optional(Type.Integer({ minimum: 1, maximum: 2000000 })),
 	},
 	{ additionalProperties: false },
 );
@@ -20,12 +22,39 @@ export type AgentRequest = Static<typeof agentSchema>;
 
 export interface ChildResult {
 	output: string;
+	outputTruncated?: boolean;
+	outputOriginalLength?: number;
 	usage: Usage;
 	turns: number;
 }
 export interface UsageObservation {
 	/** Trusted assertion that complete usage was received; can explicitly confirm a genuine zero. */
 	reported: boolean;
+}
+export interface ModelRequestEstimate {
+	estimatedInputTokens: number;
+	maxOutputTokens: number;
+	marginTokens: number;
+	/** Heuristic, not a provider tokenizer or billing receipt. */
+	estimator: "context_usage_and_chars" | "trusted_host";
+}
+export interface ToolProgress {
+	id: string;
+	name: string;
+	path?: string;
+	mutation: boolean;
+	status: "started" | "completed" | "failed" | "unknown";
+	result?: string;
+	truncated?: boolean;
+}
+export interface ChildProgress {
+	/** Retained observations are untrusted partial evidence, not task acceptance. */
+	partial: true;
+	output: string;
+	outputTruncated: boolean;
+	operations: ToolProgress[];
+	droppedOperations: number;
+	updatedAt: number;
 }
 export interface ChildOptions {
 	id: string;
@@ -37,23 +66,31 @@ export interface ChildOptions {
 	maxTurns: number;
 	maxOutputTokens: number;
 	signal: AbortSignal;
-	beforeRequest(): Promise<void>;
+	beforeRequest(estimate: ModelRequestEstimate): Promise<string>;
 	/** Provider handoff attempt, not proof the server accepted/billed the request. */
-	onRequestDispatched?(): void;
-	onUsage(usage: Usage, observation?: UsageObservation): void;
+	onRequestDispatched?(requestId: string): void;
+	onUsage(usage: Usage, observation: UsageObservation | undefined, requestId: string): void;
+	onProgress?(progress: ChildProgress): void;
 }
 export type ChildRunner = (options: ChildOptions) => Promise<ChildResult>;
+export interface WorkflowScriptResult extends AgentToolResult<unknown> {
+	/** Upstream renderer already omitted output; original length may be unavailable. */
+	outputTruncated?: boolean;
+}
 export type ScriptRunner = (
 	code: string,
 	ctx: ExtensionToolContext,
 	signal: AbortSignal,
-) => Promise<AgentToolResult<unknown>>;
+) => Promise<WorkflowScriptResult>;
 
 export interface ModelRequestRecord {
 	id: string;
 	/** Billing observation, not whether the model response or assigned work succeeded. */
-	status: "in_flight" | "reported" | "unknown";
-	/** Trusted overrides may report usage without exposing an admission callback. */
+	status: "in_flight" | "reported" | "unknown" | "not_sent";
+	estimate?: ModelRequestEstimate;
+	reservedTokens?: number;
+	underestimatedTokens?: number;
+	/** Historical overrides without admission used usage_only; new usage requires an admitted ID. */
 	source: "request_gate" | "usage_only";
 	startedAt?: number;
 	/** Time handed to the provider client; network acceptance is not asserted. */
@@ -66,8 +103,13 @@ export interface AgentRecord {
 	role: NonNullable<AgentRequest["role"]>;
 	label: string;
 	phase: string;
+	phaseId?: string;
+	budget?: BudgetTotals;
+	progress?: ChildProgress;
 	status: "queued" | "running" | "completed" | "failed" | "stopped";
 	output?: string;
+	outputTruncated?: boolean;
+	outputOriginalLength?: number;
 	error?: string;
 	turns?: number;
 	/** Missing on historical records means unavailable, not zero. */
@@ -87,14 +129,22 @@ export interface WorkflowRecord {
 	status: "running" | "paused" | "awaiting_result" | "archived";
 	outcome?: "completed" | "failed" | "stopped" | "unknown";
 	phase: string;
+	phaseId?: string;
+	phases?: Array<{ id: string; title: string }>;
+	budget?: WorkflowBudgetSnapshot;
 	agents: AgentRecord[];
 	usage: Usage;
 	createdAt: number;
 	updatedAt: number;
 	result?: string;
+	resultTruncated?: boolean;
+	resultOriginalLength?: number;
+	deliveryComplete?: boolean;
 	error?: string;
 	resultRead?: boolean;
 	usageReported?: boolean;
+	/** Actual known token count returned once to the parent; later correction isn't billed twice. */
+	usageReportedTokens?: number;
 	acknowledgedAt?: number;
 	acknowledgement?: string;
 }
