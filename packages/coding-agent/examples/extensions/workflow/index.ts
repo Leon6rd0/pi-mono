@@ -273,7 +273,7 @@ export function createWorkflowExtension(options: WorkflowOptions = {}): Extensio
 				"Workflow start is asynchronous. Finish the current response and remain available; never wait, sleep-loop or repeatedly poll for it. Real ready events arrive locally.",
 				"Use await phase('Explore'); const found = await agent('Explore...', {role:'scout'}); const reviews = await parallel([()=>agent('Review A...', {role:'reviewer'}), ()=>agent('Review B...', {role:'reviewer'})]); return reviews; for staged workflows. Pass earlier results explicitly through prompts; child contexts do not inherit the main conversation.",
 				"Use workflow result on a ready ID, process the findings, then acknowledge with a processing summary. Failed/stopped results also require review. Ack is not permission to start more work.",
-				"Scripts cannot access the filesystem/network/Node directly. Child tools have canonical workspace path checks, not an OS sandbox. The Workflow launch does not inherit main-session permission hooks or a custom Bash sandbox into child tools.",
+				"Scripts cannot access the filesystem/network/Node directly. Child tools have canonical workspace path checks, not an OS sandbox. Default local filesystem tools use shared host permission/result hooks with child cwd and lifetime. Unsupported custom backends are rejected, not replaced by local tools; no shell or OS sandbox is provided.",
 			],
 			parameters: Type.Object({
 				action: StringEnum([
@@ -319,6 +319,8 @@ export function createWorkflowExtension(options: WorkflowOptions = {}): Extensio
 						throw new Error(
 							"Select a known physical Workflow model explicitly; virtual/Ultra routers are not invoked",
 						);
+					if (!options.runChild && !ctx.createChildToolHost)
+						throw new Error("Workflow requires independent child host support; local fallback is disabled");
 					const record = current.start({
 						label: params.label,
 						cwd: params.cwd,
@@ -330,7 +332,9 @@ export function createWorkflowExtension(options: WorkflowOptions = {}): Extensio
 						thinkingLevel: pi.getThinkingLevel(),
 						context: ctx,
 						runScript,
-						runChild: options.runChild ?? createChildRunner(ctx.modelRegistry, model),
+						runChild:
+							options.runChild ??
+							createChildRunner(ctx.modelRegistry, model, ctx.createChildToolHost, options.allowWrites),
 					});
 					return dataResult({
 						workflow: summary(record),

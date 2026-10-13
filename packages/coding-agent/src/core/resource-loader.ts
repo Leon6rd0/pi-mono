@@ -1,9 +1,10 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { detectCapabilities, getTerminalColorMode, type TerminalColorMode } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { CONFIG_DIR_NAME } from "../config.ts";
 import { loadThemeFromPath, type Theme } from "../modes/interactive/theme/theme.ts";
+import type { ChildResource } from "./child-resources.ts";
 import type { ResourceDiagnostic } from "./diagnostics.ts";
 
 export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.ts";
@@ -156,6 +157,8 @@ export interface ResourceLoader {
 	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] };
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] };
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> };
+	/** Passive child constraints using this loader's real configuration; no executable discovery. */
+	getChildContextFiles?(cwd: string): ChildResource[];
 	getSystemPrompt(): string | undefined;
 	getSystemPromptSource(): { path: string } | undefined;
 	getAppendSystemPrompt(): string[];
@@ -181,22 +184,24 @@ function resolvePromptInput(input: string | undefined, description: string): str
 	return input;
 }
 
-function loadContextFileFromDir(dir: string): { path: string; content: string } | null {
+function loadContextFileFromDir(dir: string, strict = false): { path: string; content: string } | null {
 	const candidates = ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
 	for (const filename of candidates) {
 		const filePath = join(dir, filename);
-		if (existsSync(filePath)) {
+		if (strict) {
 			try {
-				if (!statSync(filePath).isFile()) {
-					continue;
-				}
-				return {
-					path: filePath,
-					content: stripBom(readFileSync(filePath, "utf-8")),
-				};
+				lstatSync(filePath);
 			} catch (error) {
-				console.error(chalk.yellow(`Warning: Could not read ${filePath}: ${error}`));
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+				throw error;
 			}
+		} else if (!existsSync(filePath)) continue;
+		try {
+			if (!statSync(filePath).isFile()) continue;
+			return { path: filePath, content: stripBom(readFileSync(filePath, "utf-8")) };
+		} catch (error) {
+			if (strict) throw error;
+			console.error(chalk.yellow(`Warning: Could not read ${filePath}: ${error}`));
 		}
 	}
 	return null;
@@ -211,7 +216,7 @@ function loadContextFileFromDir(dir: string): { path: string; content: string } 
  * file's `gitdir:` target in realpath form while cwd may still be symlinked
  * (macOS `/tmp` -> `/private/tmp`).
  */
-function findShadowedContextFile(cwd: string): string | undefined {
+function findShadowedContextFile(cwd: string, strict = false): string | undefined {
 	const gitPaths = findGitPaths(cwd);
 	if (!gitPaths) return undefined;
 	const commonGitDir = canonicalizePath(gitPaths.commonGitDir);
@@ -225,13 +230,15 @@ function findShadowedContextFile(cwd: string): string | undefined {
 	// `proj/main`) it is just the directory holding `.bare`, which tracks nothing; a
 	// submodule's gitdir has no `commondir`, so it lands under `.git/modules`.
 	if (canonicalizePath(join(mainRepoRoot, ".git")) !== commonGitDir) return undefined;
-	const worktreeContextFile = loadContextFileFromDir(worktreeRoot);
+	const worktreeContextFile = loadContextFileFromDir(worktreeRoot, strict);
 	return worktreeContextFile ? join(mainRepoRoot, basename(worktreeContextFile.path)) : undefined;
 }
 
 export function loadProjectContextFiles(options: {
 	cwd: string;
 	agentDir: string;
+	/** Independent children must not silently lose an unreadable constraint. */
+	strict?: boolean;
 }): Array<{ path: string; content: string }> {
 	const resolvedCwd = resolvePath(options.cwd);
 	const resolvedAgentDir = resolvePath(options.agentDir);
@@ -239,7 +246,7 @@ export function loadProjectContextFiles(options: {
 	const contextFiles: Array<{ path: string; content: string }> = [];
 	const seenPaths = new Set<string>();
 
-	const globalContext = loadContextFileFromDir(resolvedAgentDir);
+	const globalContext = loadContextFileFromDir(resolvedAgentDir, options.strict);
 	if (globalContext) {
 		contextFiles.push(globalContext);
 		seenPaths.add(globalContext.path);
@@ -247,11 +254,11 @@ export function loadProjectContextFiles(options: {
 
 	const ancestorContextFiles: Array<{ path: string; content: string }> = [];
 
-	const shadowedContextFile = findShadowedContextFile(resolvedCwd);
+	const shadowedContextFile = findShadowedContextFile(resolvedCwd, options.strict);
 	let currentDir = resolvedCwd;
 
 	while (true) {
-		const contextFile = loadContextFileFromDir(currentDir);
+		const contextFile = loadContextFileFromDir(currentDir, options.strict);
 		const isShadowed =
 			shadowedContextFile !== undefined && canonicalizePath(contextFile?.path ?? "") === shadowedContextFile;
 		if (contextFile && !isShadowed && !seenPaths.has(contextFile.path)) {
@@ -440,6 +447,26 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> } {
 		return { agentsFiles: this.agentsFiles };
+	}
+
+	getChildContextFiles(cwd: string): ChildResource[] {
+		const sameCwd = canonicalizePath(cwd) === canonicalizePath(this.cwd);
+		if (!sameCwd && this.agentsFilesOverride)
+			throw new Error("Custom context override cannot be rebased to a child cwd");
+		const files = sameCwd
+			? this.agentsFiles
+			: this.noContextFiles
+				? []
+				: loadProjectContextFiles({
+						cwd,
+						agentDir: this.agentDir,
+						strict: true,
+					});
+		return files.map((entry) => ({
+			...entry,
+			source: this.agentsFilesOverride ? "host" : dirname(entry.path) === this.agentDir ? "global" : "project",
+			provenance: sameCwd ? "Effective loaded context" : "Passive cross-cwd context; no executable resources",
+		}));
 	}
 
 	getSystemPrompt(): string | undefined {

@@ -7,7 +7,8 @@ The main conversation stays available and receives real result-ready events.
 
 This extension does not load or modify Codex Ultra. Children do not load the main
 session's extensions, system prompt, skills, MCP, routers, queues or conversation.
-Only explicitly supplied prompts/findings enter each child context. Credentials
+Explicit prompts/findings and host-resolved passive project constraints enter each
+child context; parent conversation history does not. Credentials
 and physical provider implementations are shared through Pi's model registry;
 this is not OS/process isolation. Virtual model selections are rejected rather
 than invoking an Ultra or other model router. Workflow may use the same physical
@@ -18,7 +19,8 @@ model without enabling an Ultra orchestration workflow.
 Load `workflow/index.ts` explicitly, or put its absolute path in the agent-directory
 `settings.json` extension list and `/reload`. Keep the sibling `task-monitor/manager.ts`
 helper alongside this directory. The scripting foundation requires the Pi fork's
-`createCodemodeExtension()` support. The `/thinking` presets additionally require
+`createCodemodeExtension()` and `ctx.createChildToolHost()` support. A missing child
+host is an error, never a fallback to unrestricted local tools. The `/thinking` presets additionally require
 core support for `RegisteredCommand.thinkingPreset`; reloading this extension on
 an older binary does **not** add the picker items. The mode commands below work
 without the picker. This is not a new stock built-in.
@@ -95,8 +97,8 @@ The selection prompt follows Claude Code's session Ultracode behavior:
 
 This is **model-facing selection guidance**, not a new per-start authorization gate
 or a guarantee that a physical model will always choose the tool. It does not implement
-Claude's keyword highlighting, workflow-plan confirmation UI, permission/sandbox
-inheritance or Agent Teams. Our opt-in mode keeps all configured limits, unlike
+Claude's keyword highlighting, workflow-plan confirmation UI, full Claude
+permission/sandbox inheritance or Agent Teams. Our opt-in mode keeps all configured limits, unlike
 Claude features that relax some concurrency/warning checks in Ultracode.
 
 Reference: local Claude Code 2.1.224 static prompts and the cached official
@@ -152,7 +154,9 @@ clamp or other orchestrators. Workflow and agent status records retain the effec
 level; older retained records may omit it. The combined preset string is rejected
 by the script bridge and never sent as provider reasoning.
 
-Roles: `scout`, `worker` (default), `reviewer`, `summarizer`. All have read/grep/find/ls.
+Roles: `scout`, `worker` (default), `reviewer`, `summarizer`. Read/grep/find/ls are
+intersected with the parent's callable tool ceiling; disabled parent tools are not
+recreated as child capabilities.
 Only `worker` gains edit/write when **both** trusted `allowWrites: true` config and
 explicit launch `write_access: true` enable it. There is no Bash, direct network
 or delegation tool. Coordinate non-overlapping file ownership in parallel workers.
@@ -293,14 +297,32 @@ billing the parent a second time; `lateReportedTokens` exposes that accounting g
   symlink escapes; concurrent filesystem changes are a TOCTOU limitation. These
   guards and tool allowlists are **not an OS sandbox**. Provider network access
   and trusted extension host code retain the Pi OS user's permissions.
-- Main-session `tool_call` hooks can block `workflow start`. Their individual tool
-  permission hooks and custom Bash backends are not silently inherited by isolated
-  children. Do not enable writes assuming a Bash-only sandbox covers them. SDK
-  runner overrides must explicitly supply their own policy, cancellation and usage.
+- Main-session `tool_call` hooks can block `workflow start`. For the default local
+  filesystem backend, individual child calls also traverse those hooks with the
+  child's cwd, identity and signal, followed by fail-closed `tool_result` filtering.
+  Tool paths are checked before approval and again immediately before execution;
+  unfiltered partial updates are not delivered. Independent records do not attach
+  to a finished parent turn. Child abort does not abort the parent; parent-turn
+  abort alone does not stop a child. Runtime reload/disposal cancels the host lifetime.
+- Unknown/custom SDK backends and replaced filesystem tools are rejected rather
+  than silently rebound locally. A Bash-only sandbox does not cover filesystem
+  tools. Shared select/confirm/input approvals receive child cancellation; custom
+  UI/editor dialogs and parent compaction/shutdown controls are unavailable in the
+  child policy context. SDK runner overrides remain trusted host code and must
+  supply their own policy, cancellation and usage.
+- Same-cwd constraints come from the effective loaded context. Cross-cwd constraints
+  use passive AGENTS/CLAUDE discovery with the loader's actual agent directory;
+  executable project resources are not loaded and project-execution trust is
+  conservatively false, not inherited from the parent. Unsupported custom resource
+  rebasing fails. Snapshots are bounded (128 KiB), never silently truncated. Loaded
+  resource/trust changes, policy registration changes and backend replacement
+  invalidate the host; arbitrary private state inside a policy handler remains its
+  responsibility. This is not a filesystem watcher or OS sandbox. Selected skills
+  are still pending; the child skill catalog is currently empty.
 
 Not included: Agent Teams teammate messaging, Claude-compatible structured schemas,
 file-based agent discovery, persistent VM checkpoints, crash replay, auto-stall
-restarts, per-child interactive approvals, worktree conflict resolution, or a full
+restarts, a dedicated per-child approval UI, worktree conflict resolution, or a full
 Claude workflow UI. See [Extensions](../../../docs/extensions.md),
 [Codemode](../../../docs/codemode.md), [Terminal UI](../../../docs/tui.md), and
 [Security](../../../docs/security.md).
@@ -312,7 +334,7 @@ From `packages/coding-agent`:
 ```sh
 node ../../node_modules/vitest/dist/cli.js --run \
   test/thinking-selector.test.ts test/suite/workflow-mode.test.ts \
-  test/suite/workflow.test.ts test/task-monitor-manager.test.ts \
+  test/suite/workflow.test.ts test/suite/workflow-host.test.ts test/task-monitor-manager.test.ts \
   test/suite/task-monitor.test.ts test/workflow-budget.test.ts \
   test/workflow-usage-view.test.ts test/workflow-request-context.test.ts \
   test/workflow-progress.test.ts

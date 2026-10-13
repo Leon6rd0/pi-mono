@@ -64,6 +64,7 @@ import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
+import { CHILD_FILESYSTEM_TOOLS, createChildToolHost } from "./child-tool-host.ts";
 import {
 	type CompactionPreparation,
 	type CompactionResult,
@@ -3466,6 +3467,24 @@ export class AgentSession {
 				getSystemPromptOptions: () => this._baseSystemPromptOptions,
 				executeTool: (callerId, name, args, options) => this._executeNestedToolCall(callerId, name, args, options),
 				getCallableTools: () => this._getCallableTools(),
+				createChildToolHost: (options) =>
+					createChildToolHost(options, {
+						runner,
+						parentCwd: this._cwd,
+						resourceLoader: this._resourceLoader,
+						isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
+						autoResizeImages: this.settingsManager.getImageAutoResize(),
+						getToolNames: () => {
+							if (this._baseToolsOverride)
+								throw new Error("Independent child host cannot rebind a custom backend");
+							for (const name of CHILD_FILESYSTEM_TOOLS) {
+								const entry = this._toolDefinitions.get(name);
+								if (entry && entry.definition !== this._baseToolDefinitions.get(name))
+									throw new Error("Independent child host cannot rebind a replaced filesystem tool");
+							}
+							return this.getCallableToolNames();
+						},
+					}),
 			},
 			{
 				registerProvider: (name, config) => {

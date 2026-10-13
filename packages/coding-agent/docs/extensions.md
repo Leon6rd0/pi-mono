@@ -149,6 +149,33 @@ A tool can run other tools with `ctx.executeTool(name, args, { signal, onUpdate 
 
 See [`hello.ts`](../examples/extensions/hello.ts), [`todo.ts`](../examples/extensions/todo.ts), [`dynamic-tools.ts`](../examples/extensions/dynamic-tools.ts), and [`truncated-tool.ts`](../examples/extensions/truncated-tool.ts).
 
+### Independent child tools
+
+For a detached Agent, do not retain `ctx.executeTool()` or the launch-turn signal.
+The optional host capability `ctx.createChildToolHost({ cwd, signal, model, thinkingLevel })`
+accepts an independent lifetime and a canonical absolute cwd. It supplies passive
+resources and a default-local filesystem adapter for `createChildResourceSnapshot()`
+and `ChildToolScope`. Use **`scope.tools`**, not the adapter's raw backend tools, in
+the child Agent; call `scope.assertActive()` around asynchronous model admission,
+and abort the host and drain `scope.close()` in `finally`. See the
+[Workflow runner](../examples/extensions/workflow/child-agent.ts) for the real wiring.
+
+Shared tool hooks receive `ctx.childScope` and the child cwd/signal/model. Child
+arguments are immutable after preparation; hooks can approve or deny, not retarget
+an approved call. Results fail closed on filter errors; raw partial updates do not
+bypass filtering. Parent compaction/shutdown and custom UI/editor dialogs are not
+available in that policy context; select/confirm/input use child cancellation.
+The read-only session manager still describes the owning parent session for trusted
+policy code, not a child transcript. It is never automatically copied into child prompts.
+
+Only the known default filesystem backend can be rebound. SDK backend overrides,
+replaced filesystem tools, unsupported cross-cwd resource resolution and missing
+host support fail instead of silently using local tools. Cross-cwd resolution uses
+the loader's configured agent directory and passive project constraints, not project
+extensions/configuration or inherited executable-resource trust. Roles, prompts,
+write opt-ins, model budgets and orchestration remain extension-owned. This is not
+an OS sandbox, a full SDK child session or an implicit continuation grant.
+
 ### Tool exposure
 
 `exposure` controls how the model reaches a tool. "Callable" means callable from other tools through `ctx.executeTool()` (`ctx.tools`), as the `codemode` tool's scripts do:

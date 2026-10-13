@@ -58,6 +58,8 @@ import type { Static, TSchema } from "typebox";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { BashResult } from "../bash-executor.ts";
 import type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult } from "../cache-warmer.ts";
+import type { ChildToolHost, ChildToolHostOptions } from "../child-tool-host.ts";
+import type { ChildScopeIdentity } from "../child-tool-scope.ts";
 import type { CompactionPreparation, CompactionResult } from "../compaction/index.ts";
 import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
@@ -331,6 +333,10 @@ export interface ExtensionContext {
 	hasUI: boolean;
 	/** Current working directory */
 	cwd: string;
+	/** Host-owned identity during child policy dispatch, not a permission grant. */
+	readonly childScope?: Readonly<ChildScopeIdentity>;
+	/** Independent host capability, when supported. No local fallback if unavailable. */
+	createChildToolHost?: (options: ChildToolHostOptions) => ChildToolHost;
 	/** Session manager (read-only) */
 	sessionManager: ReadonlySessionManager;
 	/** Model registry for API key resolution */
@@ -2207,6 +2213,8 @@ export interface ExtensionContextActions {
 		args: unknown,
 		options: ExecuteToolOptions,
 	) => Promise<AgentToolCallOutcome>;
+	/** Backs the independent child host capability; never bound to a parent turn. */
+	createChildToolHost?: (options: ChildToolHostOptions) => ChildToolHost;
 	/** Backs `ExtensionToolContext.tools`. */
 	getCallableTools?: () => readonly AgentTool[];
 }

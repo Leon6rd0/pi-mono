@@ -36,6 +36,7 @@ async function setup(
 	options: WorkflowOptions = {},
 	gate?: (pi: ExtensionAPI) => void,
 	estimate: ModelRequestEstimate = mockEstimate,
+	useHostTools = false,
 ) {
 	const executions: Execution[] = [];
 	const notices: string[] = [];
@@ -63,7 +64,8 @@ async function setup(
 		});
 	};
 	const harness = await createHarness({
-		tools: [],
+		tools: useHostTools ? undefined : [],
+		initialActiveToolNames: useHostTools ? ["read", "grep", "find", "ls", "edit", "write"] : undefined,
 		extensionFactories: [
 			createWorkflowExtension({ storageRoot, notifyModel: false, runChild: controlled, ...options }),
 			...(gate ? [gate] : []),
@@ -105,9 +107,12 @@ async function actualSetup(options: WorkflowOptions = {}) {
 		},
 		(pi) => {
 			pi.on("session_start", (_event, ctx) => {
-				if (ctx.model) actual = createChildRunner(ctx.modelRegistry, ctx.model);
+				if (ctx.model)
+					actual = createChildRunner(ctx.modelRegistry, ctx.model, ctx.createChildToolHost, options.allowWrites);
 			});
 		},
+		mockEstimate,
+		true,
 	);
 	return { ...result, release: () => release?.() };
 }
@@ -914,6 +919,11 @@ describe("independent Workflow (QuickJS and faux/local runners only)", () => {
 		]);
 		release();
 		await ready(harness, started.workflow.id);
+		// A scout must actually run and receive the denial, not pass because setup failed.
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8"))).toMatchObject({
+			outcome: "completed",
+			agents: [{ status: "completed", output: "Policy checked" }],
+		});
 		if (role === "worker") expect(readFileSync(join(harness.tempDir, "owned.txt"), "utf8")).toBe("owned change");
 		else expect(() => readFileSync(join(harness.tempDir, "owned.txt"))).toThrow();
 	});

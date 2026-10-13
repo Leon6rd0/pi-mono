@@ -36,6 +36,7 @@ export {
 	createChildResourceSnapshot,
 	type ResolvedChildResources,
 } from "./core/child-resources.ts";
+export { type ChildToolHost, type ChildToolHostOptions, childWorkspacePath } from "./core/child-tool-host.ts";
 export {
 	CHILD_TOOL_SCOPE_LIMITS,
 	type ChildScopeIdentity,

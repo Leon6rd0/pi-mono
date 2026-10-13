@@ -17,6 +17,8 @@ describe("DefaultResourceLoader", () => {
 	let tempDir: string;
 	let agentDir: string;
 	let cwd: string;
+	let inheritedFiles: ReturnType<typeof loadProjectContextFiles>;
+	let inheritedContents: string[];
 
 	beforeEach(() => {
 		tempDir = join(tmpdir(), `rl-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -24,6 +26,10 @@ describe("DefaultResourceLoader", () => {
 		cwd = join(tempDir, "project");
 		mkdirSync(agentDir, { recursive: true });
 		mkdirSync(cwd, { recursive: true });
+		// TMPDIR may itself inherit machine/project constraints. Keep exact assertions
+		// on fixture ordering without pretending those external ancestors do not exist.
+		inheritedFiles = loadProjectContextFiles({ cwd: tempDir, agentDir });
+		inheritedContents = inheritedFiles.map((file) => file.content);
 	});
 
 	afterEach(() => {
@@ -451,6 +457,7 @@ Content`,
 
 			expect(loader.getAgentsFiles().agentsFiles).toEqual([
 				{ path: join(agentDir, "AGENTS.override.md"), content: "global override" },
+				...inheritedFiles,
 				{ path: join(cwd, "AGENTS.md"), content: "project instructions" },
 				{ path: join(nestedCwd, "AGENTS.override.md"), content: "service override" },
 			]);
@@ -1240,7 +1247,7 @@ export default function(pi: ExtensionAPI) {
 
 			const files = loadProjectContextFiles({ cwd: worktreeSrc, agentDir });
 
-			expect(files.map((f) => f.content)).toEqual(["worktree instructions"]);
+			expect(files.map((f) => f.content)).toEqual([...inheritedContents, "worktree instructions"]);
 		});
 
 		it("should still inherit the main repo's context when the worktree root has none", () => {
@@ -1249,7 +1256,7 @@ export default function(pi: ExtensionAPI) {
 
 			const files = loadProjectContextFiles({ cwd: worktreeSrc, agentDir });
 
-			expect(files.map((f) => f.content)).toEqual(["main repo instructions"]);
+			expect(files.map((f) => f.content)).toEqual([...inheritedContents, "main repo instructions"]);
 		});
 
 		it("should only skip the same filename, not a differently named context file", () => {
@@ -1262,7 +1269,11 @@ export default function(pi: ExtensionAPI) {
 
 			const files = loadProjectContextFiles({ cwd: worktreeSrc, agentDir });
 
-			expect(files.map((f) => f.content)).toEqual(["main repo instructions", "worktree instructions"]);
+			expect(files.map((f) => f.content)).toEqual([
+				...inheritedContents,
+				"main repo instructions",
+				"worktree instructions",
+			]);
 		});
 
 		it("should NOT skip the container's context in a bare layout (proj/.bare + proj/main)", () => {
@@ -1285,7 +1296,11 @@ export default function(pi: ExtensionAPI) {
 
 			const files = loadProjectContextFiles({ cwd: worktree, agentDir });
 
-			expect(files.map((f) => f.content)).toEqual(["container instructions", "worktree instructions"]);
+			expect(files.map((f) => f.content)).toEqual([
+				...inheritedContents,
+				"container instructions",
+				"worktree instructions",
+			]);
 		});
 
 		it("should keep loading ancestors above the main repo", () => {
@@ -1297,7 +1312,11 @@ export default function(pi: ExtensionAPI) {
 			const files = loadProjectContextFiles({ cwd: worktreeSrc, agentDir });
 
 			// Only the main repo root's duplicate is dropped; the unrelated dir above it stays.
-			expect(files.map((f) => f.content)).toEqual(["outer instructions", "worktree instructions"]);
+			expect(files.map((f) => f.content)).toEqual([
+				...inheritedContents,
+				"outer instructions",
+				"worktree instructions",
+			]);
 		});
 
 		it("should NOT skip anything for a sibling worktree (main repo is not an ancestor)", () => {
@@ -1315,7 +1334,11 @@ export default function(pi: ExtensionAPI) {
 
 			const files = loadProjectContextFiles({ cwd: sibSrc, agentDir });
 
-			expect(files.map((f) => f.content)).toEqual(["outer instructions", "sibling worktree instructions"]);
+			expect(files.map((f) => f.content)).toEqual([
+				...inheritedContents,
+				"outer instructions",
+				"sibling worktree instructions",
+			]);
 		});
 
 		it("should NOT skip the superproject's context from inside a submodule", () => {
@@ -1334,7 +1357,11 @@ export default function(pi: ExtensionAPI) {
 
 			const files = loadProjectContextFiles({ cwd: subSrc, agentDir });
 
-			expect(files.map((f) => f.content)).toEqual(["superproject instructions", "submodule instructions"]);
+			expect(files.map((f) => f.content)).toEqual([
+				...inheritedContents,
+				"superproject instructions",
+				"submodule instructions",
+			]);
 		});
 
 		it("should keep climbing past an ordinary repo root", () => {
@@ -1350,7 +1377,12 @@ export default function(pi: ExtensionAPI) {
 
 			const files = loadProjectContextFiles({ cwd: leaf, agentDir });
 
-			expect(files.map((f) => f.content)).toEqual(["outer instructions", "repo instructions", "leaf instructions"]);
+			expect(files.map((f) => f.content)).toEqual([
+				...inheritedContents,
+				"outer instructions",
+				"repo instructions",
+				"leaf instructions",
+			]);
 		});
 
 		it("should climb normally when the gitdir: target does not exist", () => {
@@ -1363,7 +1395,7 @@ export default function(pi: ExtensionAPI) {
 
 			const files = loadProjectContextFiles({ cwd: src, agentDir });
 
-			expect(files.map((f) => f.content)).toEqual(["repo instructions", "src instructions"]);
+			expect(files.map((f) => f.content)).toEqual([...inheritedContents, "repo instructions", "src instructions"]);
 		});
 	});
 });

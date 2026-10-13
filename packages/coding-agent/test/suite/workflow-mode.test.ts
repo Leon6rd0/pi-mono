@@ -27,13 +27,18 @@ interface Execution {
 	options: ChildOptions;
 	complete(): void;
 }
-async function setup(options: WorkflowOptions = {}, reasoning = true, sessionManager?: Harness["sessionManager"]) {
+async function setup(
+	options: WorkflowOptions = {},
+	reasoning = true,
+	sessionManager?: Harness["sessionManager"],
+	useHostTools = false,
+) {
 	const executions: Execution[] = [];
 	const notices: string[] = [];
 	const root = mkdtempSync(join(tmpdir(), "pi-workflow-mode-"));
 	directories.push(root);
 	const harness = await createHarness({
-		tools: [],
+		tools: useHostTools ? undefined : [],
 		models: [{ id: "workflow-effort", reasoning }],
 		sessionManager,
 		extensionFactories: [
@@ -418,10 +423,10 @@ describe("Workflow thinking mode (no real provider calls)", () => {
 	});
 
 	it("the real isolated Agent sends effective effort to the faux provider", async () => {
-		const { harness } = await setup();
+		const { harness } = await setup({}, true, undefined, true);
 		const ctx = harness.session.extensionRunner.createContext();
 		const model = ctx.modelRegistry.find(harness.getModel().provider, harness.getModel().id)!;
-		const run = createChildRunner(ctx.modelRegistry, model);
+		const run = createChildRunner(ctx.modelRegistry, model, ctx.createChildToolHost);
 		harness.setResponses([
 			(_context, options) => {
 				expect(options?.reasoning).toBe("xhigh");

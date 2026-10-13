@@ -377,6 +377,8 @@ export class ExtensionRunner {
 	private getSystemPromptOptionsFn: () => BuildSystemPromptOptions = () =>
 		normalizeBuildSystemPromptOptions({ cwd: this.cwd });
 	private executeToolFn: ExtensionContextActions["executeTool"];
+	private createChildToolHostFn: ExtensionContextActions["createChildToolHost"];
+	private readonly lifetimeController = new AbortController();
 	private getCallableToolsFn: () => readonly AgentTool[] = () => [];
 	/** Registered MCP servers already reported as unhandled. */
 	private readonly reportedMcpServers = new Set<string>();
@@ -451,6 +453,7 @@ export class ExtensionRunner {
 		this.getSystemPromptOptionsFn =
 			contextActions.getSystemPromptOptions ?? (() => normalizeBuildSystemPromptOptions({ cwd: this.cwd }));
 		this.executeToolFn = contextActions.executeTool;
+		this.createChildToolHostFn = contextActions.createChildToolHost;
 		this.getCallableToolsFn = contextActions.getCallableTools ?? (() => []);
 
 		// Servers registered from now on reach the extension that connects them right away. Servers
@@ -724,8 +727,31 @@ export class ExtensionRunner {
 	): void {
 		if (!this.staleMessage) {
 			this.staleMessage = message;
+			this.lifetimeController.abort();
 			this.runtime.invalidate(message);
 		}
+	}
+
+	/** Session/runtime lifetime, independent of any parent agent turn. */
+	get lifetimeSignal(): AbortSignal {
+		return this.lifetimeController.signal;
+	}
+
+	/** Registration changes invalidate an independent policy snapshot; private policy state is not introspected. */
+	captureToolPolicyGuard(): () => void {
+		this.assertActive();
+		const snapshot = () =>
+			[
+				...snapshotEventHandlers(this.extensions, "tool_call"),
+				...snapshotEventHandlers(this.extensions, "tool_result"),
+			].flatMap(({ handlers }) => handlers);
+		const captured = snapshot();
+		return () => {
+			this.assertActive();
+			const current = snapshot();
+			if (current.length !== captured.length || current.some((handler, index) => handler !== captured[index]))
+				throw new Error("Child tool policy registrations changed");
+		};
 	}
 
 	private assertActive(): void {
@@ -950,6 +976,11 @@ export class ExtensionRunner {
 			getSystemPrompt: () => {
 				runner.assertActive();
 				return runner.getSystemPromptFn();
+			},
+			createChildToolHost: (options) => {
+				runner.assertActive();
+				if (!runner.createChildToolHostFn) throw new Error("Independent child host is unavailable");
+				return runner.createChildToolHostFn(options);
 			},
 		};
 	}
@@ -1189,6 +1220,15 @@ export class ExtensionRunner {
 		if (options.context || options.failClosed) this.assertActive();
 		if (options.failClosed) ctx.signal?.throwIfAborted();
 		const currentEvent: ToolResultEvent = { ...event };
+		if (options.failClosed) {
+			// A filter may transform the result, not relabel the call for later policy handlers.
+			for (const key of ["type", "toolName", "toolCallId", "parentToolCallId", "input"] as const)
+				Object.defineProperty(currentEvent, key, {
+					value: currentEvent[key],
+					writable: false,
+					configurable: false,
+				});
+		}
 		let modified = false;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "tool_result")) {
