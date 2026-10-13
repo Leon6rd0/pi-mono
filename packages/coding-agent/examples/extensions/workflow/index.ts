@@ -87,6 +87,7 @@ function summary(record: WorkflowRecord) {
 		deliveryComplete: record.deliveryComplete,
 		resultTruncated: record.resultTruncated,
 		resultOriginalLength: record.resultOriginalLength,
+		resultArchive: record.resultArchive,
 		thinkingLevel: record.thinkingLevel,
 		agents: record.agents.map(
 			({
@@ -104,6 +105,7 @@ function summary(record: WorkflowRecord) {
 				progress,
 				outputTruncated,
 				outputOriginalLength,
+				outputArchive,
 			}) => ({
 				id,
 				role,
@@ -119,8 +121,11 @@ function summary(record: WorkflowRecord) {
 				progress,
 				outputTruncated,
 				outputOriginalLength,
+				outputArchive,
 			}),
 		),
+		archiveObservation:
+			"Bounded untrusted UTF-8 final text, not transcript or execution approval. sourceBytes measures supplied text/spill, not text lost upstream; saved is historical file creation, available is checked only by status/result. Full archives do not make deliveryComplete true.",
 		progressObservation:
 			"Bounded untrusted partial execution observations; not test PASS, rollback, acceptance, or resume authority",
 		tokenObservation: "API-reported cumulative usage; in-flight and unknown requests are not zero-cost claims",
@@ -348,6 +353,7 @@ export function createWorkflowExtension(options: WorkflowOptions = {}): Extensio
 				if (!params.id) throw new Error(`${params.action} requires id`);
 				if (params.action === "status")
 					return dataResult({
+						archives: current.archives(params.id),
 						workflow: summary(current.get(params.id)),
 						logPath: current.logPath(params.id),
 						resultPath: current.recordPath(params.id),
@@ -365,6 +371,7 @@ export function createWorkflowExtension(options: WorkflowOptions = {}): Extensio
 					};
 					return {
 						...dataResult({
+							archives: current.archives(params.id, params.agent_id),
 							resultPath: current.recordPath(params.id),
 							workflow,
 							usageObservation: workflowUsageObservation(result.workflow),
@@ -413,14 +420,20 @@ export function createWorkflowExtension(options: WorkflowOptions = {}): Extensio
 						else if (action === "ack") current.acknowledge(id, rest.join(" "));
 						else if (action === "result") {
 							const record = current.result(id, false).workflow;
-							const text = safeText(JSON.stringify(record, null, 2));
+							const text = safeText(
+								JSON.stringify({ archives: current.archives(id), workflow: record }, null, 2),
+							);
 							ctx.ui.notify(
 								text.length > 12000
 									? `${text.slice(0, 12000)}\n[Display truncated; full retained record: ${safeText(current.recordPath(id))}]`
 									: text,
 								"info",
 							);
-						} else ctx.ui.notify(JSON.stringify(summary(current.get(id)), null, 2), "info");
+						} else
+							ctx.ui.notify(
+								JSON.stringify({ archives: current.archives(id), ...summary(current.get(id)) }, null, 2),
+								"info",
+							);
 					} else
 						ctx.ui.notify(
 							"/thinking xhigh+workflow | workflow-off; /workflow mode on|off|status | list | history | status ID | result ID | pause ID | resume ID | stop ID | ack ID SUMMARY | notify on|off. Esc pauses automatic model follow-ups, not workflows. Resume never restarts completed/old work.",

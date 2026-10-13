@@ -34,13 +34,17 @@ export function createScriptRunner(pi: ExtensionAPI): ScriptRunner {
 		// Codemode exposes a spill path, but no truncation flag on failed spill. Its
 		// warning is a conservative fallback: a script quoting it may be marked partial,
 		// never the reverse. Do not invent the original length of upstream-truncated text.
+		const fullOutputPath =
+			typeof details === "object" &&
+			details !== null &&
+			"fullOutputPath" in details &&
+			typeof details.fullOutputPath === "string"
+				? details.fullOutputPath
+				: undefined;
 		const outputTruncated =
-			(typeof details === "object" &&
-				details !== null &&
-				"fullOutputPath" in details &&
-				typeof details.fullOutputPath === "string") ||
+			fullOutputPath !== undefined ||
 			result.content.some((part) => part.type === "text" && part.text.startsWith("Warning: truncated output ("));
-		return { ...result, outputTruncated };
+		return { ...result, outputTruncated, ...(fullOutputPath !== undefined ? { fullOutputPath } : {}) };
 	};
 }
 

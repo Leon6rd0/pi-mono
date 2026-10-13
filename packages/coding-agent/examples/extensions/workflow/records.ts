@@ -1,5 +1,6 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { textArchiveSchema } from "./artifacts.ts";
 import { thinkingSchema } from "./types.ts";
 
 const number = Type.Number({ minimum: 0 });
@@ -94,6 +95,7 @@ export const recordSchema = Type.Object({
 			output: Type.Optional(Type.String({ maxLength: 16384 })),
 			outputTruncated: Type.Optional(Type.Boolean()),
 			outputOriginalLength: Type.Optional(Type.Integer({ minimum: 0 })),
+			outputArchive: Type.Optional(textArchiveSchema),
 			error: Type.Optional(Type.String({ maxLength: 2000 })),
 			turns: Type.Optional(number),
 			usage: Type.Optional(usageSchema),
@@ -124,6 +126,7 @@ export const recordSchema = Type.Object({
 	result: Type.Optional(Type.String({ maxLength: 65536 })),
 	resultTruncated: Type.Optional(Type.Boolean()),
 	resultOriginalLength: Type.Optional(Type.Integer({ minimum: 0 })),
+	resultArchive: Type.Optional(textArchiveSchema),
 	deliveryComplete: Type.Optional(Type.Boolean()),
 	error: Type.Optional(Type.String({ maxLength: 2000 })),
 	resultRead: Type.Optional(Type.Boolean()),

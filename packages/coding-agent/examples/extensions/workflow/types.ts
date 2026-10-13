@@ -3,6 +3,7 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
+import type { TextArchive } from "./artifacts.ts";
 import type { BudgetTotals, WorkflowBudgetSnapshot } from "./budget.ts";
 
 export const workflowThinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -21,6 +22,7 @@ export const agentSchema = Type.Object(
 export type AgentRequest = Static<typeof agentSchema>;
 
 export interface ChildResult {
+	/** Host-only final text. The manager bounds what scripts/models receive. */
 	output: string;
 	outputTruncated?: boolean;
 	outputOriginalLength?: number;
@@ -76,6 +78,8 @@ export type ChildRunner = (options: ChildOptions) => Promise<ChildResult>;
 export interface WorkflowScriptResult extends AgentToolResult<unknown> {
 	/** Upstream renderer already omitted output; original length may be unavailable. */
 	outputTruncated?: boolean;
+	/** Current trusted host spill only; never parsed from script text/JSON or persisted as an import path. */
+	fullOutputPath?: string;
 }
 export type ScriptRunner = (
 	code: string,
@@ -110,6 +114,7 @@ export interface AgentRecord {
 	output?: string;
 	outputTruncated?: boolean;
 	outputOriginalLength?: number;
+	outputArchive?: TextArchive;
 	error?: string;
 	turns?: number;
 	/** Missing on historical records means unavailable, not zero. */
@@ -139,6 +144,7 @@ export interface WorkflowRecord {
 	result?: string;
 	resultTruncated?: boolean;
 	resultOriginalLength?: number;
+	resultArchive?: TextArchive;
 	deliveryComplete?: boolean;
 	error?: string;
 	resultRead?: boolean;

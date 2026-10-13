@@ -16,6 +16,12 @@ import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Check } from "typebox/value";
 import { safeText } from "../task-monitor/manager.ts";
+import {
+	createTextArchiveWriter,
+	inspectTextArchive,
+	normalizeTextArchives,
+	type TextArchiveView,
+} from "./artifacts.ts";
 import { BudgetAdmissionError, normalizeWorkflowUsage, WorkflowBudgetLedger } from "./budget.ts";
 import { clampWorkflowThinkingLevel } from "./effort.ts";
 import { controlSchema, progressSchema, recordSchema, requestEstimateSchema } from "./records.ts";
@@ -41,6 +47,7 @@ interface Runtime {
 	children: Set<Promise<unknown>>;
 	active: number;
 	logBytes: number;
+	archive: ReturnType<typeof createTextArchiveWriter>;
 	failure?: { outcome: "stopped" | "failed"; message: string };
 }
 export interface WorkflowManagerOptions {
@@ -100,6 +107,7 @@ export class WorkflowManager {
 				const path = join(this.directory, name);
 				if (statSync(path).size > 8 * 1024 * 1024) continue;
 				const record: unknown = JSON.parse(readFileSync(path, "utf8"));
+				normalizeTextArchives(record);
 				if (!Check(recordSchema, record) || `${record.id}.json` !== name) continue;
 				if (record.status === "running" || record.status === "paused") {
 					record.status = "awaiting_result";
@@ -154,6 +162,19 @@ export class WorkflowManager {
 	}
 	get(id: string): WorkflowRecord {
 		return structuredClone(this.requireRecord(id));
+	}
+	/** File checks are explicit queries, never part of get/list, UI refresh or execution state. */
+	archives(id: string, agentId?: string): Array<TextArchiveView & { ownerId: string }> {
+		const record = this.requireRecord(id);
+		const views: Array<TextArchiveView & { ownerId: string }> = [];
+		if (!agentId && record.resultArchive)
+			views.push({ ownerId: record.id, ...inspectTextArchive(this.directory, id, "script", record.resultArchive) });
+		for (const agent of record.agents) {
+			if (!agent.outputArchive || (agentId && agent.id !== agentId)) continue;
+			const slot = agent.id.startsWith(`${id}/agent-`) ? agent.id.slice(id.length + 1) : "";
+			views.push({ ownerId: agent.id, ...inspectTextArchive(this.directory, id, slot, agent.outputArchive) });
+		}
+		return views;
 	}
 	logPath(id: string): string {
 		if (!/^workflow-[a-f0-9-]{36}$/.test(id)) throw new Error("Invalid workflow ID");
@@ -357,6 +378,7 @@ export class WorkflowManager {
 			children: new Set(),
 			active: 0,
 			logBytes: 0,
+			archive: createTextArchiveWriter(this.directory, record.id),
 		};
 		this.running.set(record.id, runtime);
 		const timer = setTimeout(() => {
@@ -474,6 +496,18 @@ export class WorkflowManager {
 							agent.outputOriginalLength = Math.max(result.outputOriginalLength ?? 0, result.output.length);
 							agent.outputTruncated =
 								result.outputTruncated === true || agent.outputOriginalLength > agent.output.length;
+							if (agent.outputTruncated) {
+								agent.outputArchive =
+									result.output.length > agent.output.length
+										? runtime.archive(agent.id.slice(record.id.length + 1), {
+												text: result.output,
+												format: "child-text",
+												sourcePartial:
+													result.outputTruncated === true ||
+													agent.outputOriginalLength > result.output.length,
+											})
+										: { state: "unavailable", reason: "source_unavailable" };
+							}
 							if (!requests.some((request) => request.dispatchedAt !== undefined)) agent.turns = result.turns;
 							this.log(record, runtime, `Agent completed: ${agent.id}`);
 							const value: JsonValue = {
@@ -598,6 +632,18 @@ export class WorkflowManager {
 					record.resultOriginalLength = result.outputTruncated ? undefined : text.length;
 					record.resultTruncated = result.outputTruncated === true || text.length > 65536;
 					record.outcome = result.isError ? "failed" : "completed";
+					if (record.resultTruncated) {
+						record.resultArchive =
+							result.fullOutputPath !== undefined
+								? runtime.archive("script", { spillPath: result.fullOutputPath })
+								: text.length > record.result.length
+									? runtime.archive("script", {
+											text,
+											format: "script-content",
+											sourcePartial: result.outputTruncated === true,
+										})
+									: { state: "unavailable", reason: "source_unavailable" };
+					}
 				} catch (error) {
 					record.outcome = "failed";
 					record.error = String(error).slice(0, 2000);

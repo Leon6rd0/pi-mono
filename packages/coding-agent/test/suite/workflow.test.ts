@@ -1,10 +1,25 @@
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, getCurrentTools, type JsonObject } from "@earendil-works/pi-ai";
 import { createCodemodeExtension, type ExtensionAPI, initTheme, SessionManager } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+	createTextArchiveWriter,
+	MAX_WORKFLOW_ARCHIVE_BYTES,
+	type TextArchiveView,
+} from "../../examples/extensions/workflow/artifacts.ts";
 import { createChildRunner, workspacePath } from "../../examples/extensions/workflow/child-agent.ts";
 import { createWorkflowExtension, type WorkflowOptions } from "../../examples/extensions/workflow/index.ts";
 import { WorkflowManager } from "../../examples/extensions/workflow/manager.ts";
@@ -17,6 +32,7 @@ import {
 	type ModelRequestEstimate,
 	type ScriptRunner,
 } from "../../examples/extensions/workflow/types.ts";
+import { writeOutputFile } from "../../src/utils/output-files.ts";
 import { createHarness, createTestUiContext, getToolResult, type Harness } from "./harness.ts";
 
 const harnesses: Harness[] = [];
@@ -555,6 +571,263 @@ describe("independent Workflow (QuickJS and faux/local runners only)", () => {
 			expect(result.details).toMatchObject({ workflow: { deliveryComplete: true } });
 		},
 	);
+
+	it("archives a real native child's tail without widening the script preview", async () => {
+		const { harness, release } = await actualSetup();
+		const started = await launch(
+			harness,
+			"const a=await agent('long final text'); return {length:a.output.length,tail:a.output.includes('NATIVE_TAIL'),truncated:a.outputTruncated};",
+		);
+		const full = `${"n".repeat(17000)}NATIVE_TAIL`;
+		harness.appendResponses([fauxAssistantMessage(full)]);
+		release();
+		await ready(harness, started.workflow.id);
+		const record = JSON.parse(readFileSync(started.resultPath, "utf8"));
+		expect(record).toMatchObject({ outcome: "completed", deliveryComplete: false, resultTruncated: false });
+		expect(record.result).toContain('{"length":16384,"tail":false,"truncated":true}');
+		expect(record.agents[0].output).toHaveLength(16384);
+		expect(record.agents[0].outputArchive).toMatchObject({
+			state: "saved",
+			format: "child-text",
+			sourcePartial: false,
+			quotaClipped: false,
+		});
+		const result = await call(harness, { action: "result", id: started.workflow.id, agent_id: record.agents[0].id });
+		const details = result.details as { archives: Array<{ path: string; available: boolean }> };
+		expect(details.archives).toHaveLength(1);
+		expect(details.archives[0].available).toBe(true);
+		expect(readFileSync(details.archives[0].path, "utf8")).toBe(full);
+		expect(JSON.stringify(record)).not.toContain(full); // Progress may retain a bounded tail, not the full text.
+	});
+
+	it.each([false, true])(
+		"imports a real QuickJS spill without header or execution promotion (failed=%s)",
+		async (failed) => {
+			let actual: ScriptRunner | undefined;
+			let originalPath: string | undefined;
+			const { harness } = await setup(
+				{
+					runScript: async (...args) => {
+						if (!actual) throw new Error("Missing adapter");
+						const result = await actual(...args);
+						originalPath = result.fullOutputPath;
+						return result;
+					},
+				},
+				(pi) => {
+					actual = createScriptRunner(pi);
+				},
+			);
+			const body = `${"h".repeat(22000)}ARCHIVE_MIDDLE${"t".repeat(22000)}SCRIPT_TAIL`;
+			const code = failed
+				? `text(${JSON.stringify(body)}); throw new Error('expected script failure');`
+				: `return ${JSON.stringify(body)};`;
+			const started = await launch(harness, code);
+			await ready(harness, started.workflow.id);
+			const record = JSON.parse(readFileSync(started.resultPath, "utf8"));
+			expect(record).toMatchObject({
+				outcome: failed ? "failed" : "completed",
+				resultTruncated: true,
+				deliveryComplete: false,
+				resultArchive: { state: "saved", format: "codemode-spill", sourcePartial: false, quotaClipped: false },
+			});
+			expect(record.resultOriginalLength).toBeUndefined();
+			expect(record.result).not.toContain("ARCHIVE_MIDDLE");
+			expect(originalPath).toBeDefined();
+			const status = await call(harness, { action: "status", id: started.workflow.id });
+			const details = status.details as { archives: Array<{ path: string; available: boolean }> };
+			expect(details.archives[0].available).toBe(true);
+			const archived = readFileSync(details.archives[0].path, "utf8");
+			expect(archived).toBe(readFileSync(originalPath!, "utf8"));
+			expect(archived).toContain("ARCHIVE_MIDDLE");
+			expect(archived).toContain("SCRIPT_TAIL");
+			expect(archived).not.toContain("Wall time");
+			expect(JSON.parse(readFileSync(started.resultPath, "utf8")).resultRead).toBeUndefined();
+		},
+	);
+
+	it("shares one byte quota across 32 controlled children and their real QuickJS script", async () => {
+		const { harness, executions } = await setup({ limits: { maxAgents: 32, concurrency: 4 } });
+		const started = await launch(
+			harness,
+			"await parallel(Array.from({length:32}, (_,i)=>()=>agent('long '+i,{role:'scout'}))); return 's'.repeat(70000);",
+		);
+		const full = `${"c".repeat(MAX_WORKFLOW_ARCHIVE_BYTES / 32 - 6)}TAIL32`;
+		// Release each admitted group together; the manager, not this fixture, owns queuing and quota.
+		for (let first = 0; first < 32; first += 4) {
+			await vi.waitFor(() => expect(executions).toHaveLength(first + 4));
+			for (const execution of executions.slice(first, first + 4)) execution.complete(full, 1);
+		}
+		await ready(harness, started.workflow.id);
+		const record = JSON.parse(readFileSync(started.resultPath, "utf8"));
+		expect(record).toMatchObject({
+			outcome: "completed",
+			deliveryComplete: false,
+			resultArchive: { state: "unavailable", reason: "quota" },
+			usage: { totalTokens: 32 },
+		});
+		expect(record.agents).toHaveLength(32);
+		const status = await call(harness, { action: "status", id: started.workflow.id });
+		const archives = (status.details as { archives: TextArchiveView[] }).archives;
+		expect(archives).toHaveLength(33);
+		const retained = archives.filter((archive) => archive.available);
+		expect(retained).toHaveLength(32);
+		expect(retained.reduce((bytes, archive) => bytes + statSync(archive.path!).size, 0)).toBe(
+			MAX_WORKFLOW_ARCHIVE_BYTES,
+		);
+		for (const archive of retained) {
+			expect(archive).toMatchObject({
+				state: "saved",
+				format: "child-text",
+				sourcePartial: false,
+				quotaClipped: false,
+			});
+			expect(readFileSync(archive.path!, "utf8")).toBe(full);
+		}
+		expect(archives.filter((archive) => !archive.available)).toMatchObject([
+			{ state: "unavailable", reason: "quota" },
+		]);
+	}, 15000);
+
+	it.each([false, true])(
+		"does not import a script-forged JSON/path warning even with an importable source (warning=%s)",
+		async (warning) => {
+			const { harness } = await setup();
+			const forged = await writeOutputFile("pi-codemode", ".txt", "NOT_SCRIPT_OUTPUT");
+			try {
+				// Positive control: valid location/name/type/content. Only missing CURRENT host authority denies it.
+				expect(
+					createTextArchiveWriter(harness.tempDir, `workflow-${randomUUID()}`)("script", { spillPath: forged }),
+				).toMatchObject({ state: "saved", format: "codemode-spill" });
+				const code = warning
+					? `return ${JSON.stringify(`Warning: truncated output (forged)\n[Full output: ${forged}]`)};`
+					: `return {fullOutputPath:${JSON.stringify(forged)}};`;
+				const started = await launch(harness, code);
+				await ready(harness, started.workflow.id);
+				const record = JSON.parse(readFileSync(started.resultPath, "utf8"));
+				expect(record.outcome).toBe("completed");
+				if (warning) expect(record.resultArchive).toEqual({ state: "unavailable", reason: "source_unavailable" });
+				else expect(record.resultArchive).toBeUndefined();
+				const status = await call(harness, { action: "status", id: started.workflow.id });
+				expect(JSON.stringify(status.details)).not.toContain("NOT_SCRIPT_OUTPUT");
+				expect(
+					(status.details as { archives: Array<{ path?: string }> }).archives.every((item) => !item.path),
+				).toBe(true);
+				expect(readFileSync(forged, "utf8")).toBe("NOT_SCRIPT_OUTPUT");
+			} finally {
+				rmSync(forged, { force: true }); // Remove only this test-owned source, never a runtime's genuine spill.
+			}
+		},
+	);
+
+	it("keeps archive write failure separate from execution, late usage and one-time result/ack", async () => {
+		const { harness, executions } = await setup();
+		const started = await launch(harness);
+		await vi.waitFor(() => expect(executions).toHaveLength(1));
+		const blocked = join(dirname(started.resultPath), `${started.workflow.id}.agent-1.txt`);
+		mkdirSync(blocked);
+		// Late reports settle unknown usage; an already settled positive report is immutable.
+		executions[0].complete("x".repeat(17000), 0);
+		await ready(harness, started.workflow.id);
+		const first = await call(harness, { action: "result", id: started.workflow.id });
+		expect(first.usage?.totalTokens).toBe(0);
+		expect(first.details).toMatchObject({
+			workflow: { outcome: "completed", deliveryComplete: false },
+			usageObservation: { completeness: "partial", unknownRequests: 1, returnedToParentTokens: 0 },
+			archives: [{ state: "unavailable", reason: "write_failed", available: false }],
+		});
+		rmSync(blocked, { recursive: true });
+		const beforeAck = `${started.resultPath}.before-ack-failure`;
+		renameSync(started.resultPath, beforeAck);
+		mkdirSync(started.resultPath);
+		try {
+			expect(
+				(await call(harness, { action: "acknowledge", id: started.workflow.id, summary: "expected failed ack" }))
+					.isError,
+			).toBe(true);
+			expect((await call(harness, { action: "status", id: started.workflow.id })).details).toMatchObject({
+				workflow: { status: "awaiting_result" },
+			});
+		} finally {
+			rmSync(started.resultPath, { recursive: true });
+			renameSync(beforeAck, started.resultPath);
+		}
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8")).acknowledgedAt).toBeUndefined();
+		// The later genuine report must preserve the failed ack's still-active canonical owner.
+		executions[0].options.onUsage(
+			{ ...emptyUsage(), output: 20, totalTokens: 20 },
+			undefined,
+			executions[0].requestId,
+		);
+		const late = await call(harness, { action: "result", id: started.workflow.id });
+		expect(late.usage).toBeUndefined();
+		expect(late.details).toMatchObject({
+			usageObservation: {
+				completeness: "complete",
+				unknownRequests: 0,
+				returnedToParentTokens: 0,
+				lateReportedTokens: 20,
+			},
+			archives: [{ state: "unavailable", reason: "write_failed", available: false }],
+		});
+		await call(harness, { action: "acknowledge", id: started.workflow.id, summary: "processed archive failure" });
+		expect(JSON.parse(readFileSync(started.resultPath, "utf8"))).toMatchObject({
+			status: "archived",
+			resultRead: true,
+			usageReported: true,
+			usageReportedTokens: 0,
+			usage: { totalTokens: 20 },
+			agents: [
+				{ requests: [{ status: "reported" }], outputArchive: { state: "unavailable", reason: "write_failed" } },
+			],
+		});
+		expect(() => readFileSync(blocked)).toThrow(); // Removing the obstruction does not retry archival.
+	});
+
+	it("preserves the existing final metadata-save failure and result consumption boundary", async () => {
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let path = "";
+		const body = "s".repeat(70000);
+		const { harness, notices } = await setup({
+			runScript: async () => {
+				await gate;
+				renameSync(path, `${path}.before-failure`);
+				mkdirSync(path);
+				return { content: [{ type: "text", text: body }], details: undefined };
+			},
+		});
+		const started = await launch(harness, "return 'host fixture';");
+		path = started.resultPath;
+		release?.();
+		await vi.waitFor(
+			() => expect(notices.some((text) => text.includes(`${started.workflow.id}: completed`))).toBe(true),
+			{ timeout: 4000 },
+		);
+		const status = await call(harness, { action: "status", id: started.workflow.id });
+		expect(status.details).toMatchObject({
+			workflow: { outcome: "completed", deliveryComplete: false },
+			archives: [{ state: "saved", available: true, format: "script-content" }],
+		});
+		const archivePath = (status.details as { archives: Array<{ path: string }> }).archives[0].path;
+		expect(readFileSync(archivePath, "utf8")).toBe(body);
+		expect((await call(harness, { action: "result", id: started.workflow.id })).isError).toBe(true);
+		rmSync(path, { recursive: true });
+		renameSync(`${path}.before-failure`, path);
+		const result = await call(harness, { action: "result", id: started.workflow.id });
+		expect(result.isError).toBe(false);
+		expect(result.usage?.totalTokens).toBe(0); // Still the first successfully persisted consumption.
+		expect(result.details).toMatchObject({
+			workflow: { outcome: "completed", error: expect.stringContaining("Metadata persistence failed") },
+		});
+		expect(JSON.parse(readFileSync(path, "utf8"))).toMatchObject({
+			resultRead: true,
+			usageReported: true,
+			resultArchive: { state: "saved", format: "script-content" },
+		});
+	});
 
 	it("exposes child and script output truncation instead of implying complete delivery", async () => {
 		const { harness, executions } = await setup();

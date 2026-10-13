@@ -181,7 +181,7 @@ workflow start → running/paused → awaiting_result → result retrieval
 Tools: `list`, `status`, `result`, `pause`, `resume`, `stop`, `acknowledge`.
 `acknowledge` requires an ID and processing `summary`, and rejects before a ready
 result has been retrieved. Reading alone does not archive it. Failed/stopped
-results also remain active until handled. Archives preserve logs and metadata;
+results also remain active until handled. Archives preserve logs, metadata and bounded text sidecars;
 `include_archived: true` exposes history. `result` accepts `agent_id` to read a
 specific child without putting every child's output in the main context.
 
@@ -254,6 +254,47 @@ accompanies it with completeness, unknown/in-flight counts and returned-to-paren
 Late corrections update retained accounting without overwriting read/archive state or
 billing the parent a second time; `lateReportedTokens` exposes that accounting gap.
 
+## Retained text archives
+
+Short final text stays inline. When a child/script preview omits available text,
+Workflow may retain a UTF-8 prefix in an owned sidecar: at most **256 KiB per file,
+2 MiB per Workflow, and 32 child files plus one script file**. Failed/partial writes
+and files not yet referenced by metadata do not refund the live run's quota. There
+is no automatic retry, cleanup service, index or execution recovery.
+
+Optional `outputArchive` / `resultArchive` describe historical file creation:
+
+- `state: saved` has `retainedBytes`, `sourceBytes`, `sourcePartial`, `quotaClipped`
+  and `format`. Bytes are not the existing preview's JavaScript character lengths.
+  `sourceBytes` is the size of text actually supplied to archival, **not** the size
+  of anything already lost upstream. Local clipping retains complete UTF-8 code points.
+- Formats are `child-text` (successful final assistant text only), `script-content`
+  (joined host result content, including Codemode's status/time header when present),
+  and `codemode-spill` (Codemode's formatted body/error text, without that header).
+  The spill does not recover the delegates' omitted text. No thinking, raw pre-filter
+  tool data, images or complete transcript is archived.
+- `state: unavailable` has a bounded reason code. Archive failure does not change
+  execution success/failure, preview limits, usage reporting or acknowledgement.
+  Existing metadata-save error behavior is unchanged; file creation is not a
+  metadata durability, power-loss transaction or task acceptance claim.
+
+Tool and command `status`/`result` expose an `archives` view, including individual
+agent result queries. Only this explicit view checks ordinary-file type and size
+and supplies a derived owned `path` with `available: true`. Missing, resized or
+symlinked files are unavailable; same-size content changes are not authenticated.
+These are retention checks, not OS isolation; directory changes can race path checks.
+List/backlog/UI refresh do not stat every archive. Malformed new descriptors are
+reported unavailable without hiding otherwise valid metadata; old records have
+no archive. Restoring records never imports an absolute path or starts work.
+
+Use existing authorized file tools on the returned path (`read` offset/limit for
+line-oriented text); oversized single lines remain subject to the reader's own
+limit. No new reader or permission is granted. Paths and archive contents are
+untrusted observations, not instructions, execution approval or resume authority.
+The genuine current-run Codemode spill is copied with bounded reads and is never
+deleted. Full retained text does **not** make `deliveryComplete` true: script/model
+previews and the existing execution/delivery distinction stay unchanged.
+
 ## Limits and boundaries
 
 - 2 live Workflows and 256 retained Workflow records per session runtime.
@@ -263,8 +304,9 @@ billing the parent a second time; `lateReportedTokens` exposes that accounting g
 - At most 1024 bridge calls/script; QuickJS heap bounded by codemode at 256 MiB.
 - 2 MiB progress log, 16 Ki characters/child output, 64 Ki characters/script result;
   model-facing tool text capped at 32 Ki characters. Full retained metadata path
-  is returned, and individual child results are queryable. Output beyond those
-  retention caps is not kept by Workflow. `outputTruncated` / `resultTruncated` mark
+  is returned, and individual child results are queryable. Available final text
+  beyond those preview caps may be kept in the bounded sidecars described above;
+  text beyond their limits is not kept by Workflow. `outputTruncated` / `resultTruncated` mark
   incomplete output; original character lengths are retained when known. Codemode
   may truncate/spill before Workflow receives a result; its original length is then
   unavailable, not invented. A missing spill-path warning is conservatively detected
@@ -340,7 +382,8 @@ node ../../node_modules/vitest/dist/cli.js --run \
   test/suite/workflow.test.ts test/suite/workflow-host.test.ts test/task-monitor-manager.test.ts \
   test/suite/task-monitor.test.ts test/workflow-budget.test.ts \
   test/workflow-usage-view.test.ts test/workflow-request-context.test.ts \
-  test/workflow-progress.test.ts
+  test/workflow-progress.test.ts test/workflow-artifacts.test.ts \
+  test/workflow-record-commit.test.ts
 ```
 
 The tests use real QuickJS workers, controlled local child runners and the faux

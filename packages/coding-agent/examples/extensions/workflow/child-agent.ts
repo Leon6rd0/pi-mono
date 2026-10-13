@@ -115,8 +115,8 @@ export function createChildRunner(
 					.map((part) => part.text)
 					.join("\n");
 				return {
-					output: output.slice(0, 16384),
-					outputTruncated: output.length > 16384,
+					output,
+					outputTruncated: false,
 					outputOriginalLength: output.length,
 					usage,
 					turns,
