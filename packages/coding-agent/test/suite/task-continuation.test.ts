@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { registerWorkflowActivity, type WorkflowActivity } from "../../examples/extensions/task-monitor/activity.ts";
 import { CONTINUITY_ENTRY, CONTINUITY_MESSAGE } from "../../examples/extensions/task-monitor/continuation.ts";
 import { createTaskMonitorExtension } from "../../examples/extensions/task-monitor/index.ts";
+import { TaskManager } from "../../examples/extensions/task-monitor/manager.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "../utilities.ts";
 import { createHarness, createTestUiContext, getToolResult, type Harness } from "./harness.ts";
 
@@ -165,7 +166,7 @@ describe("task continuation in the real AgentSession boundary (offline faux)", (
 		const { harness } = await setup({ confirm: true });
 		const id = await recordPlan(harness);
 		harness.setResponses([
-			taskCall({ action: "continue", id, max_continuations: 1 }),
+			taskCall({ action: "continue", id, max_continuations: 1, duration_minutes: 720 }),
 			fauxAssistantMessage("Enabled."),
 			fauxAssistantMessage("One continuation only."),
 			fauxAssistantMessage("must not run"),
@@ -173,6 +174,13 @@ describe("task continuation in the real AgentSession boundary (offline faux)", (
 		await harness.session.prompt("Enable with confirmation");
 		await harness.session.waitForIdle();
 		expect(getToolResult(harness, "tasks").isError).toBe(false);
+		const grant = (
+			getToolResult(harness, "tasks").details as {
+				continuity: { approvedAt: number; expiresAt: number; limit: number };
+			}
+		).continuity;
+		expect(grant.limit).toBe(1);
+		expect(grant.expiresAt - grant.approvedAt).toBe(720 * 60_000);
 		expect(harness.getPendingResponseCount()).toBe(1);
 	});
 
@@ -229,7 +237,7 @@ describe("task continuation in the real AgentSession boundary (offline faux)", (
 		).toHaveLength(1);
 	});
 
-	it("new user input and explicit pause cannot silently re-arm an old plan", async () => {
+	it("ordinary user input cannot silently re-arm an explicitly paused plan", async () => {
 		const { harness } = await setup();
 		const id = await recordPlan(harness);
 		harness.setResponses([taskCall({ action: "pause" }), fauxAssistantMessage("paused")]);
@@ -258,11 +266,23 @@ describe("task continuation in the real AgentSession boundary (offline faux)", (
 				}),
 				{ stopReason: "toolUse" },
 			),
+			taskCall({ action: "runtime" }),
 			fauxAssistantMessage("Waiting for real completion."),
 		]);
 		await harness.session.prompt(`/tasks continue ${id}`);
 		await harness.session.waitForIdle();
 		const jobId = (getToolResult(harness, "background").details as { job: { id: string } }).job.id;
+		const beforeQuestion = getToolResult(harness, "tasks").details;
+		harness.setResponses([
+			taskCall({ action: "runtime" }),
+			fauxAssistantMessage("The job is still running; your question does not revoke the plan."),
+		]);
+		await harness.session.prompt("How is the original task progressing?");
+		expect(getToolResult(harness, "tasks").details).toEqual(beforeQuestion);
+		expect(beforeQuestion).toMatchObject({
+			runtimeVersion: "task-continuity-v2",
+			continuity: { state: "waiting", plan: { state: "armed", used: 1 } },
+		});
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("background", { action: "status", id: jobId }), { stopReason: "toolUse" }),
 			taskCall({ action: "acknowledge", id: jobId, summary: "Read exit status; verified success" }),
@@ -437,7 +457,7 @@ describe("task continuation in the real AgentSession boundary (offline faux)", (
 		});
 	});
 
-	it("pending user input takes priority without spending another continuation", async () => {
+	it("pending user input is answered first, then the same grant continues without renewal", async () => {
 		let inject = false;
 		const { harness } = await setup({
 			before: (pi) =>
@@ -451,16 +471,34 @@ describe("task continuation in the real AgentSession boundary (offline faux)", (
 		inject = true;
 		harness.setResponses([
 			fauxAssistantMessage("Premature done."),
-			fauxAssistantMessage("Answer the queued request."),
-			fauxAssistantMessage("must not continue old plan"),
+			() => {
+				expect(
+					harness.sessionManager
+						.getEntries()
+						.filter((entry) => entry.type === "custom_message" && entry.customType === CONTINUITY_MESSAGE),
+				).toHaveLength(1);
+				return fauxAssistantMessage("Answer the queued request before the next plan step.");
+			},
+			taskCall({
+				action: "update",
+				id,
+				status: "completed",
+				summary: "Original scoped task finished after answering",
+			}),
+			fauxAssistantMessage("Original task completed."),
 		]);
 		await harness.session.prompt(`/tasks continue ${id}`);
 		await harness.session.waitForIdle();
-		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(harness.getPendingResponseCount()).toBe(0);
 		expect(
 			harness.sessionManager
 				.getEntries()
 				.filter((entry) => entry.type === "custom_message" && entry.customType === CONTINUITY_MESSAGE),
+		).toHaveLength(2);
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === CONTINUITY_ENTRY),
 		).toHaveLength(1);
 	});
 
@@ -545,6 +583,230 @@ describe("task continuation in the real AgentSession boundary (offline faux)", (
 		await harness.session.waitForIdle();
 		expect(queries).toBeGreaterThan(0);
 		expect(getToolResult(harness, "tasks").isError).toBe(true);
+		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+
+	it("malformed continuation commands preserve the existing grant and branch receipt", async () => {
+		const { harness } = await setup();
+		const id = await recordPlan(harness);
+		harness.setResponses([
+			fauxAssistantMessage(
+				fauxToolCall("background", {
+					action: "start",
+					cwd: harness.tempDir,
+					command: "controlled",
+					label: "waiting",
+				}),
+				{ stopReason: "toolUse" },
+			),
+			taskCall({ action: "runtime" }),
+			fauxAssistantMessage("Waiting."),
+		]);
+		await harness.session.prompt(`/tasks continue ${id} 25 90`);
+		await harness.session.waitForIdle();
+		const before = getToolResult(harness, "tasks").details;
+		const receipts = harness.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "custom" && entry.customType === CONTINUITY_ENTRY);
+		for (const params of ["0 60", "129 60", "4 0", "4 1441", "NaN 60", "3 1.5", "3 60 extra"])
+			await harness.session.prompt(`/tasks continue ${id} ${params}`);
+		harness.setResponses([taskCall({ action: "runtime" }), fauxAssistantMessage("Original grant is unchanged.")]);
+		await harness.session.prompt("Inspect without changing the existing authorization");
+		expect(getToolResult(harness, "tasks").details).toEqual(before);
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === CONTINUITY_ENTRY),
+		).toEqual(receipts);
+	});
+
+	it.each(["input", "queued-user-message"] as const)(
+		"%s invalidates a first activation dialog without granting late consent",
+		async (kind) => {
+			const { harness } = await setup();
+			const id = await recordPlan(harness);
+			let accept: ((value: boolean) => void) | undefined;
+			await harness.session.bindExtensions({
+				mode: "rpc",
+				uiContext: createTestUiContext({
+					confirm: () =>
+						new Promise<boolean>((resolve) => {
+							accept = resolve;
+						}),
+				}),
+			});
+			harness.setResponses([
+				taskCall({ action: "continue", id }),
+				fauxAssistantMessage("Confirmation became stale."),
+				fauxAssistantMessage("must not continue"),
+			]);
+			const prompt = harness.session.prompt("Ask for first confirmation");
+			await vi.waitFor(() => expect(accept).toBeDefined());
+			if (kind === "input")
+				await harness.session.extensionRunner.emitInput("A new user question", undefined, "interactive");
+			else
+				await harness.session.extensionRunner.emit({
+					type: "message_start",
+					message: { role: "user", content: "Queued user question", timestamp: Date.now() },
+				});
+			accept!(true);
+			await prompt;
+			expect(getToolResult(harness, "tasks").isError).toBe(true);
+			expect(
+				harness.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "custom" && entry.customType === CONTINUITY_ENTRY),
+			).toHaveLength(0);
+			expect(harness.getPendingResponseCount()).toBe(1);
+		},
+	);
+
+	it("receipt write failure does not leave a usable authorization", async () => {
+		const { harness } = await setup({ confirm: true });
+		const id = await recordPlan(harness);
+		const append = vi.spyOn(harness.sessionManager, "appendCustomEntry").mockImplementation(() => {
+			throw new Error("receipt storage unavailable");
+		});
+		harness.setResponses([
+			taskCall({ action: "continue", id }),
+			fauxAssistantMessage("No authorization written."),
+			fauxAssistantMessage("must not continue"),
+		]);
+		await harness.session.prompt("Confirm activation with broken receipt storage");
+		append.mockRestore();
+		expect(getToolResult(harness, "tasks").isError).toBe(true);
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom_message" && entry.customType === CONTINUITY_MESSAGE),
+		).toHaveLength(0);
+	});
+
+	it("a receipt appended before ledger failure cannot authorize a continuation", async () => {
+		const { harness } = await setup({ confirm: true });
+		const id = await recordPlan(harness);
+		const storage = vi
+			.spyOn(TaskManager.prototype, "continuityPath")
+			.mockReturnValue(join(harness.tempDir, "missing-parent", "continuity.json"));
+		harness.setResponses([
+			taskCall({ action: "continue", id }),
+			fauxAssistantMessage("Ledger write failed."),
+			fauxAssistantMessage("must not continue"),
+		]);
+		try {
+			await harness.session.prompt("Request confirmation with unavailable ledger storage");
+		} finally {
+			storage.mockRestore();
+		}
+		expect(getToolResult(harness, "tasks").isError).toBe(true);
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === CONTINUITY_ENTRY),
+		).toHaveLength(1);
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom_message" && entry.customType === CONTINUITY_MESSAGE),
+		).toHaveLength(0);
+	});
+
+	it("processed failure plus an explicit corrective checkpoint advances without replaying the failed job", async () => {
+		const { harness, executions } = await setup({ notifyModel: true });
+		const id = await recordPlan(harness);
+		harness.setResponses([
+			fauxAssistantMessage(
+				fauxToolCall("background", {
+					action: "start",
+					cwd: harness.tempDir,
+					command: "broken-fixture",
+					label: "verify",
+				}),
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("Wait for the actual result."),
+		]);
+		await harness.session.prompt(`/tasks continue ${id}`);
+		await harness.session.waitForIdle();
+		const jobId = (getToolResult(harness, "background").details as { job: { id: string } }).job.id;
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("background", { action: "status", id: jobId }), { stopReason: "toolUse" }),
+			taskCall({
+				action: "acknowledge",
+				id: jobId,
+				summary: "Read failure; fixture path is wrong, do not rerun unchanged",
+			}),
+			taskCall({
+				action: "update",
+				id,
+				resolved_failures: [jobId],
+				next_action: {
+					key: "repair-fixture",
+					instruction: "Correct the identified fixture path before any fresh validation",
+				},
+				summary: "Failure classified; correction is the next step",
+			}),
+			fauxAssistantMessage("Correction recorded; next phase later."),
+			taskCall({ action: "get", id: jobId }),
+			() => {
+				expect(getToolResult(harness, "tasks").details).toMatchObject({
+					task: { status: "failed", review: "acknowledged" },
+				});
+				return taskCall({ action: "pause" });
+			},
+			fauxAssistantMessage("Reached the next scoped step without restarting the failed executor."),
+		]);
+		executions[0]({ exitCode: 1 });
+		await vi.waitFor(() => expect(harness.getPendingResponseCount()).toBe(0), { timeout: 5000 });
+		await harness.session.waitForIdle();
+		expect(executions).toHaveLength(1);
+		expect(getToolResult(harness, "tasks").details).toMatchObject({
+			continuity: { state: "paused", plan: { resolvedFailures: [jobId] } },
+		});
+	});
+
+	it("the assistant can pause for a scope-changing user request before starting unrelated work", async () => {
+		let inject = false;
+		const { harness } = await setup({
+			before: (pi) => {
+				pi.on("agent_end", () => {
+					if (inject) {
+						inject = false;
+						pi.sendUserMessage("Pause this plan and run a different task", { deliverAs: "followUp" });
+					}
+				});
+			},
+		});
+		const id = await recordPlan(harness);
+		inject = true;
+		harness.setResponses([
+			fauxAssistantMessage("Await user input."),
+			taskCall({ action: "get", id }),
+			() => {
+				expect(getToolResult(harness, "tasks").details).toMatchObject({
+					continuity: { plan: { state: "armed", used: 1 } },
+				});
+				return taskCall({ action: "pause" });
+			},
+			fauxAssistantMessage(
+				fauxToolCall("background", {
+					action: "start",
+					cwd: harness.tempDir,
+					command: "different-task",
+					label: "unrelated",
+				}),
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("Separate work is not authorized or charged by the paused plan."),
+			fauxAssistantMessage("must not resume old plan"),
+		]);
+		await harness.session.prompt(`/tasks continue ${id}`);
+		await harness.session.waitForIdle();
+		expect(
+			(getToolResult(harness, "background").details as { job: { parentTaskId?: string } }).job.parentTaskId,
+		).toBeUndefined();
 		expect(harness.getPendingResponseCount()).toBe(1);
 	});
 

@@ -10,7 +10,7 @@ extension files alone is not proof that a running session has reloaded them.
 
 - `tasks`: create/list/get/update/acknowledge logical tasks with dependencies,
   durable checkpoints, and explicitly enabled bounded continuation. `runtime`
-  reports the loaded feature identity (`task-continuity-v1`) and adapter readiness.
+  reports the loaded feature identity (`task-continuity-v2`), continuation limits and adapter readiness.
   Default lists track active and unprocessed work, not all historical records.
 - `background`: start/list/status/stop shell jobs. Starting returns a job ID,
   rather than keeping a tool call open until the command finishes.
@@ -84,17 +84,26 @@ For example, after creating a root task:
 ```
 
 This is a checkpoint, **not opt-in**. Enable it with the user command
-`/tasks continue task-<root-uuid> [1-16]`, or `tasks` action `continue` with a fresh
+`/tasks continue task-<root-uuid> [count] [minutes]`, or `tasks` action `continue` with a fresh
 UI confirmation. No UI means tool-based activation is refused. Scope, next step,
 and limits are shown before confirmation. Mode ON, notify ON, model prose, task
 labels and child results never substitute for task-specific opt-in.
 
-Only one root can be armed. Defaults: 8 continuation/event prompt reservations,
-maximum 16, within 30 minutes. Accounting is saved before dispatch. Two repeated
-unchanged progress comparisons pause the plan; merely updating summary text does
-not reset this guard. These are **not token, billing or total model-request caps**:
-ordinary tool turns within a request cycle still occur, and Workflow retains its
-own separate budgets. Explicit renewal starts a new finite allowance.
+Only one root can be armed. New confirmations default to **32 continuation/event
+prompt reservations within 240 minutes (4 hours)**. Choose `max_continuations`
+(1–128) and `duration_minutes` (1–1440, up to 24 hours), or the command's optional
+count and minutes. Confirmation shows the selected limits; the widget/runtime
+exposes the persisted expiry. Wall-clock time includes background waits. Expiry
+stops future automatic prompts, not work already dispatched. An ordinary question
+never resets a counter/deadline or re-arms a paused plan. Old ledger values are
+preserved; installing new defaults does not extend existing consent.
+
+Accounting is saved before dispatch. Two repeated unchanged progress comparisons
+pause the plan; merely updating summary text does not reset this guard. These are
+**not token, billing or total model-request caps**: ordinary tool turns within a
+request cycle still occur, and Workflow retains its own separate budgets. Explicit
+renewal starts a new finite allowance. Invalid activation parameters do not write
+a receipt; an interrupted/failed activation cannot leave a usable partial grant.
 
 At a successful settle boundary, a ready plan requests its next scoped step.
 Live executors and unprocessed results suppress boundary continuation: wait for
@@ -111,13 +120,49 @@ active Workflow activity also blocks completion. Workflow IDs observed during th
 armed interval are recorded through a trusted metadata adapter, not inferred from
 child output. The session-wide Workflow activity gate is deliberately conservative.
 
-`/tasks pause`, new user input, branch changes, Escape/error, explicit job stop,
-and reload revoke future plan scheduling. They do not undo work or retract an
-already dispatched model request. Failed/stopped/unknown outcomes block automatic
-progress; they are not replayed. Reload retains checkpoint/counter evidence but
-requires a new explicit continuation command; notification toggles do not re-arm
-it. Existing `running` records migrate as bookkeeping, never as authorization.
-A plan paused while a job runs can need explicit result processing before renewal.
+Ordinary user input has priority, but does not revoke an existing grant: answer it
+before any next task step. Input still invalidates an open activation dialog, even
+before the first grant. The assistant must call `tasks pause` **before acting on a
+natural-language stop, changed scope, unrelated new work, or new permission request**.
+This is model-facing guidance, not a natural-language intent classifier. Use the
+deterministic `/tasks pause` or Escape for an immediate control action. Unrelated
+work must not be attached to the old plan simply because its receipt is still live.
+
+`/tasks pause`, branch changes, Escape/error, explicit job stop and reload revoke
+future scheduling. They do not undo work or retract an already dispatched request.
+Stopped/unknown work is not recoverable as an ordinary failed step. Stop blocks the
+current grant even after acknowledgement; a later explicit new grant can authorize
+different work, never restart the old executor. Unknown task records still require
+external inspection rather than a guessed outcome. Reload retains checkpoint and
+counter evidence but requires fresh opt-in; notification toggles do not re-arm it.
+
+A failed result waits for processing without permanently revoking consent. Read and
+acknowledge it, then update the root with `resolved_failures` and a **different,
+concrete corrective `next_action`** before settling. Changing only its key is not
+enough. The IDs must belong to acknowledged failed jobs/tasks or archived failed
+Workflows in this grant; stopped/unknown results cannot be resolved this way. A job
+and its linked leaf count as one attempt. For example, after inspecting/acknowledging
+the indicated failure:
+
+```json
+{
+  "action": "update",
+  "id": "task-<root-uuid>",
+  "resolved_failures": ["job-<failed-uuid>"],
+  "next_action": {
+    "key": "repair-fixture",
+    "instruction": "Correct the fixture path identified in the failure log before fresh validation"
+  },
+  "summary": "Failure inspected; do not rerun the unchanged command"
+}
+```
+
+This records a correction association, not proof that the correction works, a retry
+scheduler, new permission or success. Failed history and failed dependencies remain
+failed; old executors/leaves cannot be restarted. Recovery accounting must be saved
+before automatic advancement. A paused/expired grant stays paused/expired even if
+its failure checkpoint is updated. Existing `running` records are bookkeeping, not
+authorization; paused plans may need result processing before explicit renewal.
 
 The panel distinguishes `task:needs-continuation`, `task:waiting-job`, actual
 `job:running`, and plan ready/waiting/awaiting-processing/paused/blocked states.
@@ -181,7 +226,7 @@ User commands:
 ```text
 /tasks list
 /tasks history
-/tasks continue task-<root-uuid> 8
+/tasks continue task-<root-uuid> 32 240
 /tasks pause
 /tasks logs job-<uuid>
 /tasks ack job-<uuid> Read exit status and handled the result

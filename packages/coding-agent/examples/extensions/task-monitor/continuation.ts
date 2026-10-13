@@ -3,14 +3,15 @@ import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "n
 import { type Static, Type } from "typebox";
 import { Check } from "typebox/value";
 import type { WorkflowActivity } from "./activity.ts";
-import type { TaskManager, TaskRecord } from "./manager.ts";
+import type { TaskCheckpoint, TaskManager, TaskRecord } from "./manager.ts";
 
 export const CONTINUITY_ENTRY = "task-continuity-consent-v1";
 export const CONTINUITY_MESSAGE = "task-continuity-step-v1";
 export const CONTINUITY_LIMITS = Object.freeze({
-	defaultContinuations: 8,
-	maxContinuations: 16,
-	lifetimeMs: 30 * 60_000,
+	defaultContinuations: 32,
+	maxContinuations: 128,
+	defaultDurationMinutes: 240,
+	maxDurationMinutes: 1440,
 	maxNoProgress: 2,
 });
 
@@ -29,8 +30,9 @@ const planSchema = Type.Object({
 	reason: Type.Optional(Type.String({ maxLength: 1000 })),
 	approvedAt: Type.Number(),
 	expiresAt: Type.Number(),
-	limit: Type.Integer({ minimum: 1, maximum: 16 }),
-	used: Type.Integer({ minimum: 0, maximum: 16 }),
+	limit: Type.Integer({ minimum: 1, maximum: CONTINUITY_LIMITS.maxContinuations }),
+	used: Type.Integer({ minimum: 0, maximum: CONTINUITY_LIMITS.maxContinuations }),
+	resolvedFailures: Type.Optional(Type.Array(Type.String({ maxLength: 200 }), { maxItems: 2000 })),
 	stalled: Type.Integer({ minimum: 0, maximum: 2 }),
 	lastFingerprint: Type.Optional(Type.String({ maxLength: 100 })),
 	workflowIds: Type.Array(Type.String({ maxLength: 200 }), { maxItems: 1000 }),
@@ -88,24 +90,37 @@ export class TaskContinuation {
 		return this.plan ? structuredClone(this.plan) : undefined;
 	}
 
-	/** Called only by a user command or after a fresh UI confirmation, never by update/restore. */
-	activate(
-		rootId: string,
-		receipt: string,
-		source: ContinuityPlan["source"],
-		limit: number = CONTINUITY_LIMITS.defaultContinuations,
-	): ContinuityPlan {
+	/** Non-mutating preflight: invalid requests must not overwrite branch consent. */
+	validateActivation(rootId: string, limit: number, durationMinutes: number): void {
 		const task = this.manager.get(rootId);
 		if (task.kind !== "task" || task.parentTaskId || task.review || !["pending", "running"].includes(task.status))
 			throw new Error("Continuation requires an active root task");
 		if (!task.nextAction || task.blockedReason)
 			throw new Error("Record an unblocked next_action checkpoint before enabling continuation");
 		if (!Number.isInteger(limit) || limit < 1 || limit > CONTINUITY_LIMITS.maxContinuations)
-			throw new Error("Continuation limit must be 1–16");
+			throw new Error(`Continuation limit must be 1–${CONTINUITY_LIMITS.maxContinuations}`);
+		if (
+			!Number.isInteger(durationMinutes) ||
+			durationMinutes < 1 ||
+			durationMinutes > CONTINUITY_LIMITS.maxDurationMinutes
+		)
+			throw new Error(`Continuation duration must be 1–${CONTINUITY_LIMITS.maxDurationMinutes} minutes`);
 		if (this.manager.descendants(rootId).some((entry) => entry.kind === "job" && entry.review !== "acknowledged"))
 			throw new Error("Inspect and process existing executors before activation; unknown work cannot be resumed");
 		if (this.plan?.state === "armed" && this.plan.rootId !== rootId)
 			throw new Error("Pause the other active plan first");
+	}
+
+	/** Called only by a user command or fresh UI confirmation, never by update/restore. */
+	activate(
+		rootId: string,
+		receipt: string,
+		source: ContinuityPlan["source"],
+		limit: number = CONTINUITY_LIMITS.defaultContinuations,
+		durationMinutes: number = CONTINUITY_LIMITS.defaultDurationMinutes,
+	): ContinuityPlan {
+		this.validateActivation(rootId, limit, durationMinutes);
+		const task = this.manager.get(rootId);
 		const now = this.now();
 		this.persist({
 			version: 1,
@@ -115,14 +130,67 @@ export class TaskContinuation {
 			scope: task.label,
 			state: "armed",
 			approvedAt: now,
-			expiresAt: now + CONTINUITY_LIMITS.lifetimeMs,
+			expiresAt: now + durationMinutes * 60_000,
 			limit,
 			used: 0,
 			stalled: 0,
 			workflowIds: [],
 			notified: [],
+			resolvedFailures: [],
 		});
 		return this.snapshot()!;
+	}
+
+	private failures(workflows: WorkflowActivity[]) {
+		const plan = this.plan!;
+		return [
+			...this.manager
+				.descendants(plan.rootId)
+				.filter((entry) => entry.createdAt >= plan.approvedAt && (entry.resultStatus ?? entry.status) === "failed")
+				.map((entry) => ({ id: entry.id, processed: entry.review === "acknowledged", taskId: entry.taskId })),
+			...workflows
+				.filter((entry) => plan.workflowIds.includes(entry.id) && entry.outcome === "failed")
+				.map((entry) => ({ id: entry.id, processed: entry.status === "archived", taskId: undefined })),
+		];
+	}
+
+	/** Associate processed failures with an explicit corrective checkpoint, never a retry or a new grant. */
+	recordRecovery(
+		rootId: string,
+		ids: string[],
+		checkpoint: TaskCheckpoint,
+		workflows: WorkflowActivity[] | undefined,
+	): TaskRecord {
+		const plan = this.plan;
+		if (!plan || plan.rootId !== rootId || plan.state === "completed" || !workflows)
+			throw new Error("Failure recovery requires the recorded plan and a known Workflow adapter");
+		const previous = this.manager.get(rootId).nextAction;
+		const next = checkpoint.nextAction;
+		if (!next?.instruction.trim() || next.instruction.trim() === previous?.instruction.trim())
+			throw new Error(
+				"Record a different corrective next_action instruction; changing only its key is insufficient",
+			);
+		if (!ids.length || ids.length > 50 || new Set(ids).size !== ids.length)
+			throw new Error("resolved_failures requires 1–50 distinct failed executor IDs");
+		const failures = this.failures(workflows);
+		for (const id of ids) {
+			if (!failures.some((entry) => entry.id === id && entry.processed))
+				throw new Error(
+					"Read and acknowledge each failed result before recording recovery; stopped/unknown are not failures to resolve",
+				);
+		}
+		// A job and its linked logical leaf are two records of the same failed attempt.
+		const resolved = new Set([...(plan.resolvedFailures ?? []), ...ids]);
+		for (const entry of failures) {
+			if (entry.taskId && (resolved.has(entry.id) || resolved.has(entry.taskId))) {
+				resolved.add(entry.id);
+				resolved.add(entry.taskId);
+			}
+		}
+		// Checkpoint first: if durable resolution accounting fails, advancement remains blocked.
+		const task = this.manager.updateTask(rootId, undefined, checkpoint);
+		this.persist({ ...plan, resolvedFailures: [...resolved] });
+		return task;
 	}
 
 	pause(reason: string): void {
@@ -191,22 +259,29 @@ export class TaskContinuation {
 				reason: "Workflow activity adapter unavailable; refusing to guess executor state",
 			};
 		const owned = this.manager.descendants(plan.rootId);
-		const failed = owned.find(
+		const unsafe = owned.find(
 			(entry) =>
 				entry.status === "unknown" ||
 				entry.resultStatus === "unknown" ||
-				(entry.createdAt >= plan.approvedAt && ["failed", "stopped"].includes(entry.resultStatus ?? entry.status)),
+				(entry.createdAt >= plan.approvedAt && (entry.resultStatus ?? entry.status) === "stopped"),
 		);
-		const workflowFailure = workflows.find(
-			(entry) =>
-				plan.workflowIds.includes(entry.id) &&
-				(entry.outcome === "unknown" || entry.outcome === "failed" || entry.outcome === "stopped"),
+		const unsafeWorkflow = workflows.find(
+			(entry) => plan.workflowIds.includes(entry.id) && (entry.outcome === "unknown" || entry.outcome === "stopped"),
 		);
-		if (failed || workflowFailure)
+		if (unsafe || unsafeWorkflow)
 			return {
 				...base,
 				state: "blocked",
-				reason: `Inspect failed/stopped/unknown work ${failed?.id ?? workflowFailure?.id}; no automatic replay`,
+				reason: `Inspect stopped/unknown work ${unsafe?.id ?? unsafeWorkflow?.id}; no automatic replay`,
+			};
+		const unresolved = this.failures(workflows).filter((entry) => !plan.resolvedFailures?.includes(entry.id));
+		if (unresolved.length)
+			return {
+				...base,
+				state: "awaiting_processing",
+				waitingOn: unresolved.map((entry) => entry.id),
+				reason:
+					"Read/acknowledge failed results, then tasks update with resolved_failures and a different corrective next_action; never replay unchanged work",
 			};
 		// Conservative session-wide Workflow gate: there is no claim that another extension's
 		// detached executor belongs to this plan simply because its label looks related.
@@ -269,7 +344,7 @@ export class TaskContinuation {
 			.update(
 				JSON.stringify({
 					phase: root.phase,
-					key: root.nextAction?.key,
+					nextAction: root.nextAction,
 					work: this.manager
 						.descendants(root.id)
 						.filter((entry) => entry.id !== root.id)
@@ -286,7 +361,7 @@ export class TaskContinuation {
 			return;
 		}
 		this.persist({ ...this.plan, used: this.plan.used + 1, stalled, lastFingerprint: fingerprint });
-		return `Task continuation under explicit task-specific opt-in, not a new request or permission grant. Continue only the existing approved scope. Preserve tool approvals, budgets and write restrictions. Do not replay failed/stopped/unknown work. Record phase, summary and next_action through tasks.update; if blocked, record blocked_reason. A prose completion is not task completion.\n${JSON.stringify({ taskId: root.id, scope: this.plan.scope, phase: root.phase, summary: root.summary, nextAction: root.nextAction, continuation: this.plan.used, limit: this.plan.limit })}`;
+		return `Task continuation under explicit task-specific opt-in, not a new request or permission grant. Continue only the existing approved scope. Preserve tool approvals, budgets and write restrictions. Do not replay failed/stopped/unknown work. Handle new user input first; pause this plan before acting on a stop request, changed scope, unrelated new work or new permission requirement. Ordinary questions do not extend or renew this authorization. After processing a failure, record resolved_failures and a different corrective next_action; an acknowledgement alone is not a correction. Record phase, summary and next_action through tasks.update; if blocked, record blocked_reason. A prose completion is not task completion.\n${JSON.stringify({ taskId: root.id, scope: this.plan.scope, phase: root.phase, summary: root.summary, nextAction: root.nextAction, continuation: this.plan.used, limit: this.plan.limit })}`;
 	}
 }
 

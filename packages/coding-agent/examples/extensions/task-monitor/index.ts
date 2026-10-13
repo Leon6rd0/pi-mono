@@ -19,6 +19,7 @@ import {
 	CONTINUITY_ENTRY,
 	CONTINUITY_LIMITS,
 	CONTINUITY_MESSAGE,
+	type ContinuityPlan,
 	TaskContinuation,
 	taskDisplayState,
 } from "./continuation.ts";
@@ -55,7 +56,7 @@ function dataResult(value: unknown) {
 }
 
 const outputSchema = Type.Object({}, { additionalProperties: true });
-const runtimeVersion = "task-continuity-v1";
+const runtimeVersion = "task-continuity-v2";
 
 export function createTaskMonitorExtension(options: TaskMonitorOptions = {}): ExtensionFactory {
 	if (options.storageRoot && !isAbsolute(options.storageRoot)) throw new Error("storageRoot must be absolute");
@@ -123,7 +124,7 @@ export function createTaskMonitorExtension(options: TaskMonitorOptions = {}): Ex
 					];
 					if (continuity?.plan)
 						rows.push(
-							`Plan ${continuity.state} · ${continuity.plan.used}/${continuity.plan.limit} continuations${continuity.reason ? ` · ${safeText(continuity.reason)}` : ""}`,
+							`Plan ${continuity.state} · ${continuity.plan.used}/${continuity.plan.limit} continuations · expires ${new Date(continuity.plan.expiresAt).toLocaleString()}${continuity.reason ? ` · ${safeText(continuity.reason)}` : ""}`,
 						);
 					for (const record of (running.length ? running : records.slice(-3)).slice(0, 4)) {
 						rows.push(
@@ -241,15 +242,17 @@ export function createTaskMonitorExtension(options: TaskMonitorOptions = {}): Ex
 		const enableContinuation = async (
 			id: string,
 			limit: number,
+			durationMinutes: number,
 			ctx: ExtensionContext,
 			confirm: boolean,
 			signal?: AbortSignal,
 		) => {
 			const current = getManager(ctx);
+			continuation!.validateActivation(id, limit, durationMinutes);
 			const before = JSON.stringify(current.get(id));
 			const token = generation;
 			const task = current.get(id);
-			const preview = `Task: ${task.id}\nScope: ${task.label}\nPhase: ${task.phase ?? "unset"}\nNext: ${JSON.stringify(task.nextAction ?? null)}\nUp to ${limit} automatic continuation/event prompts in 30 minutes. Normal tool permissions still apply. Failed/stopped/unknown work is not restarted. Reload and interruption pause this authorization. This is not a token/billing cap.`;
+			const preview = `Task: ${task.id}\nScope: ${task.label}\nPhase: ${task.phase ?? "unset"}\nNext: ${JSON.stringify(task.nextAction ?? null)}\nUp to ${limit} automatic continuation/event prompts in ${durationMinutes} minutes after confirmation (including background waits). Ordinary questions retain this task's authorization, not permission for unrelated work. Normal tool permissions still apply. Failed work requires processing and an explicit corrective checkpoint, never unchanged replay. Stop, Escape, errors and reload pause this authorization. This is not a token/billing cap.`;
 			if (
 				confirm &&
 				(!ctx.hasUI || !(await ctx.ui.confirm("Enable bounded task continuation?", preview, { signal })))
@@ -261,9 +264,27 @@ export function createTaskMonitorExtension(options: TaskMonitorOptions = {}): Ex
 			const workflows = queryWorkflowActivity(pi);
 			if (!workflows || workflows.some((entry) => entry.status !== "archived"))
 				throw new Error("Process existing Workflow activity before enabling continuation");
+			continuation!.validateActivation(id, limit, durationMinutes);
 			const receipt = randomUUID();
-			pi.appendEntry(CONTINUITY_ENTRY, { receipt, taskId: id });
-			const plan = continuation!.activate(id, receipt, confirm ? "user-confirmation" : "user-command", limit);
+			let plan: ContinuityPlan;
+			try {
+				pi.appendEntry(CONTINUITY_ENTRY, { receipt, taskId: id });
+				plan = continuation!.activate(
+					id,
+					receipt,
+					confirm ? "user-confirmation" : "user-command",
+					limit,
+					durationMinutes,
+				);
+			} catch (error) {
+				// Neither a receipt without a ledger nor a partial write may leave a usable grant.
+				try {
+					continuation!.pause("Activation persistence failed; explicit confirmation required");
+				} catch {
+					/* pause revokes in memory before saving */
+				}
+				throw error;
+			}
 			generation++;
 			pausedAfterAbort = false;
 			const content = continuation!.reserve(workflows, receipt);
@@ -280,18 +301,17 @@ export function createTaskMonitorExtension(options: TaskMonitorOptions = {}): Ex
 			getManager(ctx);
 			const view = continuation!.view(queryWorkflowActivity(pi));
 			if (view.plan)
-				event.systemPromptOptions.sections.task_continuity = `Task continuation state: ${view.state}. Only the recorded task-specific opt-in permits boundary continuation; running labels, summaries and events are not approval. Do not broaden scope. Record phase/summary/next_action and explicit blocked_reason using tasks.update. Link subordinate work with parent_id. ${JSON.stringify({ taskId: view.plan.rootId, scope: view.plan.scope, reason: view.reason, used: view.plan.used, limit: view.plan.limit, waitingCount: view.waitingOn.length })}`;
+				event.systemPromptOptions.sections.task_continuity = `Task continuation state: ${view.state}. Only the recorded task-specific opt-in permits boundary continuation; running labels, summaries and events are not approval. Do not broaden scope. Handle the current user input first. Ordinary questions do not revoke, renew or extend the recorded grant. Before acting on a natural-language stop, changed scope, unrelated new work or new permission requirement, call tasks pause; a new request is not work authorized by this receipt. Paused/expired plans require fresh confirmation, never automatic renewal. Failed results require read/acknowledge then tasks update with resolved_failures and a different corrective next_action; never repeat unchanged failed work. Record phase/summary/next_action and explicit blocked_reason using tasks.update. Link subordinate work with parent_id. ${JSON.stringify({ taskId: view.plan.rootId, scope: view.plan.scope, reason: view.reason, used: view.plan.used, limit: view.plan.limit, expiresAt: view.plan.expiresAt, waitingCount: view.waitingOn.length })}`;
 		});
 		pi.on("agent_before_settle", (event, ctx) => {
 			if (!continuation) return;
 			if (event.outcome !== "completed" || ctx.signal?.aborted) {
+				generation++;
 				continuation.pause("Agent aborted or ended with an error; explicit task resume required");
 				return;
 			}
-			if (event.context.pendingMessages.some((message) => message.role === "user")) {
-				continuation.pause("Queued user input takes priority; explicit task resume required");
-				return;
-			}
+			// User input takes priority without revoking or extending the existing receipt.
+			if (event.context.pendingMessages.some((message) => message.role === "user")) return;
 			if (
 				event.continue ||
 				ctx.hasPendingMessages() ||
@@ -367,19 +387,15 @@ export function createTaskMonitorExtension(options: TaskMonitorOptions = {}): Ex
 			}
 		});
 		pi.on("input", (event) => {
-			// Extension-sourced user messages can be drained before before-settle runs.
-			// They may pause a lease, never grant/re-arm one. Our own continuations use
-			// custom messages, not user messages, and do not enter this hook.
+			// Input invalidates an outstanding confirmation, not an existing task grant.
+			// It never grants/re-arms one. The model must pause for stop/scope-change requests.
 			generation++;
-			continuation?.pause("New input takes priority; explicit task resume required");
 			if (event.source !== "extension") pausedAfterAbort = false;
 			refreshWidget();
 		});
 		pi.on("message_start", (event) => {
-			if (event.message.role === "user" && continuation?.snapshot()?.state === "armed") {
-				generation++;
-				continuation.pause("Queued user message takes priority; explicit task resume required");
-			}
+			// Also covers queued messages arriving before a first/paused-plan confirmation.
+			if (event.message.role === "user") generation++;
 		});
 
 		pi.registerTool({
@@ -455,9 +471,11 @@ export function createTaskMonitorExtension(options: TaskMonitorOptions = {}): Ex
 			name: "tasks",
 			label: "Tasks",
 			description:
-				"Track durable tasks and checkpoints: create/update/list/get/acknowledge. update persists summary, phase, next_action and blocked_reason; running alone does not execute work. Link child tasks with parent_id. continue requires user confirmation and starts bounded task-specific continuation; pause revokes it. A job exit requires result processing and acknowledge, not automatic success. Failed/stopped/unknown work is not replayed. Lists show active/unprocessed records. Reload pauses continuation and preserves checkpoints.",
+				"Track durable tasks and checkpoints: create/update/list/get/acknowledge. update persists summary, phase, next_action and blocked_reason; running alone does not execute work. Link child tasks with parent_id. continue requires user confirmation of duration_minutes/max_continuations (defaults 240 minutes/32 prompts); ordinary questions retain but never renew that grant, pause revokes it. After acknowledging a failure, update with resolved_failures and a different corrective next_action before advancing. A job exit requires result processing and acknowledge, not automatic success. Failed/stopped/unknown work is not replayed. Lists show active/unprocessed records. Reload pauses continuation and preserves checkpoints.",
 			promptGuidelines: [
 				"After handling a background result, use tasks acknowledge with a processing summary. Do not acknowledge running work, discard failed results, or use timer-based hiding as a substitute for processing.",
+				"For a failed result, record a concrete different next_action with resolved_failures (the processed job/Workflow IDs) before settling. This permits a corrective step within the current grant, not unchanged retries or reactivation of stopped/unknown work.",
+				"Handle new user input first. Use tasks pause before acting on a stop request, changed scope, unrelated new work or new permission requirement. Ordinary questions must not silently extend an existing grant or re-arm a paused one.",
 			],
 			parameters: Type.Object({
 				action: StringEnum([
@@ -485,7 +503,13 @@ export function createTaskMonitorExtension(options: TaskMonitorOptions = {}): Ex
 					]),
 				),
 				blocked_reason: Type.Optional(Type.Union([Type.Null(), Type.String({ maxLength: 1000 })])),
-				max_continuations: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
+				max_continuations: Type.Optional(Type.Integer({ minimum: 1, maximum: CONTINUITY_LIMITS.maxContinuations })),
+				duration_minutes: Type.Optional(
+					Type.Integer({ minimum: 1, maximum: CONTINUITY_LIMITS.maxDurationMinutes }),
+				),
+				resolved_failures: Type.Optional(
+					Type.Array(Type.String({ maxLength: 200 }), { minItems: 1, maxItems: 50 }),
+				),
 
 				status: Type.Optional(StringEnum(["pending", "running", "completed", "stopped"] as const)),
 				summary: Type.Optional(Type.String({ maxLength: 1000 })),
@@ -500,6 +524,7 @@ export function createTaskMonitorExtension(options: TaskMonitorOptions = {}): Ex
 				if (params.action === "runtime")
 					return dataResult({
 						runtimeVersion,
+						continuityLimits: CONTINUITY_LIMITS,
 						workflowAdapterReady: queryWorkflowActivity(pi) !== undefined,
 						continuity: continuation!.view(queryWorkflowActivity(pi)),
 					});
@@ -516,6 +541,7 @@ export function createTaskMonitorExtension(options: TaskMonitorOptions = {}): Ex
 							continuity: await enableContinuation(
 								params.id,
 								params.max_continuations ?? CONTINUITY_LIMITS.defaultContinuations,
+								params.duration_minutes ?? CONTINUITY_LIMITS.defaultDurationMinutes,
 								ctx,
 								true,
 								signal,
@@ -602,14 +628,25 @@ export function createTaskMonitorExtension(options: TaskMonitorOptions = {}): Ex
 					if (!workflows || workflows.some((entry) => entry.status !== "archived"))
 						throw new Error("Process Workflow activity before completing the plan");
 				}
-				return dataResult({
-					task: current.updateTask(params.id, params.status, {
-						summary: params.summary,
-						phase: params.phase,
-						nextAction: params.next_action,
-						blockedReason: params.blocked_reason,
-					}),
-				});
+				const checkpoint = {
+					summary: params.summary,
+					phase: params.phase,
+					nextAction: params.next_action,
+					blockedReason: params.blocked_reason,
+				};
+				if (params.resolved_failures) {
+					if (params.status)
+						throw new Error("Failure recovery records a corrective checkpoint, not a task status change");
+					return dataResult({
+						task: continuation!.recordRecovery(
+							params.id,
+							params.resolved_failures,
+							checkpoint,
+							queryWorkflowActivity(pi),
+						),
+					});
+				}
+				return dataResult({ task: current.updateTask(params.id, params.status, checkpoint) });
 			},
 		});
 
@@ -652,17 +689,22 @@ export function createTaskMonitorExtension(options: TaskMonitorOptions = {}): Ex
 
 		pi.registerCommand("tasks", {
 			description:
-				"Tasks: list/history/logs/ack/stop; continue ROOT_ID [1-16] explicitly enables bounded continuation; pause revokes it",
+				"Tasks: list/history/logs/ack/stop; continue ROOT_ID [count] [minutes] enables bounded continuation (defaults 32/240); pause revokes it",
 			handler: async (args, ctx) => {
 				const current = getManager(ctx);
 				const [action = "list", id] = args.trim().split(/\s+/).filter(Boolean);
 				try {
 					if (action === "continue") {
-						if (!id) throw new Error("Usage: /tasks continue ROOT_ID [1-16]; record next_action first");
-						const limit = args.trim().split(/\s+/)[2];
+						const parts = args.trim().split(/\s+/);
+						if (!id || parts.length > 4)
+							throw new Error(
+								"Usage: /tasks continue ROOT_ID [1–128] [1–1440 minutes]; record next_action first",
+							);
+						const [, , limit, minutes] = parts;
 						await enableContinuation(
 							id,
 							limit === undefined ? CONTINUITY_LIMITS.defaultContinuations : Number(limit),
+							minutes === undefined ? CONTINUITY_LIMITS.defaultDurationMinutes : Number(minutes),
 							ctx,
 							false,
 						);
@@ -716,7 +758,7 @@ export function createTaskMonitorExtension(options: TaskMonitorOptions = {}): Ex
 						);
 					} else {
 						ctx.ui.notify(
-							"/tasks list | history | logs JOB_ID | ack ID SUMMARY | continue ROOT_ID [1-16] | pause | stop JOB_ID|all | unwatch MONITOR_ID | notify on|off. continue is explicit scoped opt-in with a 30-minute lifetime; tools retain their permission checks. Esc, new user input, reload and stop pause continuation. Reload/quit stops owned jobs; it does not replay them.",
+							"/tasks list | history | logs JOB_ID | ack ID SUMMARY | continue ROOT_ID [count 1–128] [minutes 1–1440] | pause | stop JOB_ID|all | unwatch MONITOR_ID | notify on|off. Defaults: 32 prompts in 240 minutes including background waits, not a billing cap. Questions retain the existing grant without renewal; pause for stop/scope/permission changes. Esc, reload, errors and stop revoke future continuation; tools retain their permission checks. Reload/quit stops owned jobs; it does not replay them.",
 							"info",
 						);
 					}

@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -77,7 +77,7 @@ describe("durable task checkpoints and continuation", () => {
 		const { manager, driver, root } = setup();
 		const child = manager.createTask("child", [], root.id);
 		expect(() => driver.activate(child.id, "receipt", "user-command")).toThrow("root");
-		expect(() => driver.activate(root.id, "receipt", "user-command", 17)).toThrow("1–16");
+		expect(() => driver.activate(root.id, "receipt", "user-command", 129)).toThrow("1–128");
 		driver.activate(root.id, "receipt", "user-command");
 		expect(driver.reserve([], "other branch")).toBeUndefined();
 		expect(driver.snapshot()).toMatchObject({ state: "paused", used: 0 });
@@ -99,6 +99,23 @@ describe("durable task checkpoints and continuation", () => {
 		});
 	});
 
+	it("recognizes changed instructions with the same phase/key without resetting the finite allowance", () => {
+		const { manager, driver, root } = setup();
+		driver.activate(root.id, "receipt", "user-command", 3);
+		for (const instruction of [
+			"Inspect the specified source",
+			"Implement the verified correction",
+			"Validate the corrected behavior",
+		]) {
+			manager.updateTask(root.id, undefined, { nextAction: { key: "same-step", instruction } });
+			expect(driver.reserve([], "receipt")).toContain(instruction);
+			expect(driver.snapshot()?.stalled).toBe(0);
+		}
+		expect(driver.snapshot()?.used).toBe(3);
+		expect(driver.reserve([], "receipt")).toBeUndefined();
+		expect(driver.snapshot()?.reason).toContain("count limit");
+	});
+
 	it("real checkpoint changes do not reset the hard continuation allowance", () => {
 		const { manager, driver, root } = setup();
 		driver.activate(root.id, "receipt", "user-command", 3);
@@ -117,7 +134,7 @@ describe("durable task checkpoints and continuation", () => {
 	it("expiry and explicit pause never restart an executor", () => {
 		const { driver, root, time, executions } = setup();
 		driver.activate(root.id, "receipt", "user-command");
-		time(1000 + CONTINUITY_LIMITS.lifetimeMs);
+		time(1000 + CONTINUITY_LIMITS.defaultDurationMinutes * 60_000);
 		expect(driver.reserve([], "receipt")).toBeUndefined();
 		expect(driver.snapshot()?.reason).toContain("time limit");
 		expect(executions).toEqual([]);
@@ -164,18 +181,53 @@ describe("durable task checkpoints and continuation", () => {
 		expect(driver.snapshot()?.state).toBe("completed");
 	});
 
-	it("a failed child keeps its outcome and blocks automatic next-step dispatch", async () => {
+	it("a processed failed attempt needs a different corrective checkpoint, not just acknowledgement", async () => {
 		const { manager, driver, root, storageRoot, executions } = setup();
 		driver.activate(root.id, "receipt", "user-command");
-		const job = manager.start({ command: "verify", label: "verify", cwd: storageRoot, parentTaskId: root.id });
+		const leaf = manager.createTask("verify", [], root.id);
+		const job = manager.start({
+			command: "verify",
+			label: "verify",
+			cwd: storageRoot,
+			parentTaskId: root.id,
+			taskId: leaf.id,
+		});
 		await tick();
 		executions[0]({ exitCode: 1 });
 		await tick();
+		const correction = {
+			nextAction: {
+				key: "repair",
+				instruction: "Correct the fixture identified in the failure log before a new validation",
+			},
+		};
 		expect(driver.reserveEvent([job.id], "receipt")).toBe(true);
-		manager.acknowledge(job.id, "Failure retained, not retried");
 		expect(driver.reserve([], "receipt")).toBeUndefined();
-		expect(driver.snapshot()?.state).toBe("blocked");
+		expect(driver.view([]).state).toBe("awaiting_processing");
+		expect(() => driver.recordRecovery(root.id, [job.id], correction, [])).toThrow("acknowledge");
+		manager.acknowledge(job.id, "Read failure; incorrect fixture identified, not retried");
+		expect(driver.reserve([], "receipt")).toBeUndefined();
+		expect(driver.snapshot()?.state).toBe("armed");
+		expect(() =>
+			driver.recordRecovery(
+				root.id,
+				[job.id],
+				{ nextAction: { ...manager.get(root.id).nextAction!, key: "new-key-only" } },
+				[],
+			),
+		).toThrow("different corrective");
+		expect(() => driver.recordRecovery(root.id, ["invented-id"], correction, [])).toThrow("acknowledge");
+		driver.recordRecovery(root.id, [job.id], correction, []);
+		expect(driver.reserve([], "receipt")).toContain("Correct the fixture");
+		expect(driver.snapshot()).toMatchObject({
+			receipt: "receipt",
+			resolvedFailures: expect.arrayContaining([job.id, leaf.id]),
+		});
 		expect(manager.get(job.id).status).toBe("failed");
+		expect(manager.get(leaf.id).status).toBe("failed");
+		const dependent = manager.createTask("requires successful verify", [leaf.id], root.id);
+		expect(() => manager.updateTask(dependent.id, "running")).toThrow("dependencies");
+		expect(() => manager.updateTask(leaf.id, "pending")).toThrow("Archived");
 		expect(executions).toHaveLength(1);
 	});
 
@@ -284,6 +336,163 @@ describe("durable task checkpoints and continuation", () => {
 		expect(() => driver.trackWorkflows(oversized)).toThrow("size limit");
 		expect(readFileSync(manager.continuityPath(), "utf8")).toBe(before);
 		expect(driver.snapshot()?.used).toBe(0);
+	});
+
+	it("uses explicit bounded duration/count and preserves old ledger values on reload", () => {
+		const { manager, driver, root } = setup();
+		expect(driver.activate(root.id, "defaults", "user-command")).toMatchObject({
+			limit: 32,
+			expiresAt: 1000 + 240 * 60_000,
+		});
+		const before = driver.snapshot();
+		for (const value of [0, 129, 1.5, Number.NaN, Infinity])
+			expect(() => driver.activate(root.id, "bad-count", "user-command", value, 60)).toThrow();
+		for (const value of [0, 1441, 1.5, Number.NaN, Infinity])
+			expect(() => driver.activate(root.id, "bad-time", "user-command", 4, value)).toThrow();
+		expect(driver.snapshot()).toEqual(before);
+		expect(driver.activate(root.id, "custom", "user-command", 128, 1440)).toMatchObject({
+			limit: 128,
+			expiresAt: 1000 + 1440 * 60_000,
+		});
+		const legacy = driver.activate(root.id, "legacy", "user-command", 8, 30);
+		delete legacy.resolvedFailures;
+		writeFileSync(manager.continuityPath(), JSON.stringify(legacy));
+		const restored = new TaskContinuation(manager, () => 1000 + 31 * 60_000);
+		expect(restored.snapshot()).toMatchObject({ state: "paused", limit: 8, used: 0, expiresAt: 1000 + 30 * 60_000 });
+		expect(restored.reserve([], "legacy")).toBeUndefined();
+	});
+
+	it("waiting counts toward the chosen duration but expiry does not stop an active executor", async () => {
+		const { manager, driver, root, storageRoot, time, executions } = setup();
+		driver.activate(root.id, "receipt", "user-command", 3, 1);
+		const job = manager.start({
+			command: "controlled",
+			label: "controlled",
+			cwd: storageRoot,
+			parentTaskId: root.id,
+		});
+		await tick();
+		time(60_999);
+		expect(driver.view([]).state).toBe("waiting");
+		time(61_000);
+		expect(driver.reserveEvent([job.id], "receipt")).toBe(false);
+		expect(driver.reserve([], "receipt")).toBeUndefined();
+		expect(driver.snapshot()).toMatchObject({ state: "paused", used: 0 });
+		expect(manager.get(job.id).status).toBe("running");
+		expect(executions).toHaveLength(1);
+	});
+
+	it("durably accounts past 16 and rejects an event at the exact chosen cap", () => {
+		const { manager, driver, root } = setup();
+		driver.activate(root.id, "receipt", "user-command", 17);
+		const workflows = Array.from({ length: 18 }, (_, i) => ({
+			id: `wf-${i}`,
+			createdAt: 1001,
+			status: "awaiting_result" as const,
+			outcome: "completed" as const,
+		}));
+		driver.trackWorkflows(workflows);
+		for (const entry of workflows.slice(0, 17)) expect(driver.reserveEvent([entry.id], "receipt")).toBe(true);
+		expect(JSON.parse(readFileSync(manager.continuityPath(), "utf8"))).toMatchObject({ used: 17, limit: 17 });
+		expect(driver.reserveEvent([workflows[17].id], "receipt")).toBe(false);
+		expect(driver.snapshot()).toMatchObject({ used: 17, state: "paused" });
+	});
+
+	it("an archived failed Workflow needs a corrective checkpoint and retains its failed outcome", () => {
+		const { driver, root } = setup();
+		driver.activate(root.id, "receipt", "user-command");
+		const running = { id: "wf-failure", status: "running" as const, createdAt: 1001 };
+		driver.trackWorkflows([running]);
+		const ready = { ...running, status: "awaiting_result" as const, outcome: "failed" as const };
+		expect(driver.reserve([ready], "receipt")).toBeUndefined();
+		const archived = { ...ready, status: "archived" as const };
+		expect(driver.reserve([archived], "receipt")).toBeUndefined();
+		driver.recordRecovery(
+			root.id,
+			[archived.id],
+			{
+				nextAction: {
+					key: "fix-input",
+					instruction: "Repair the invalid review packet path before starting a different review",
+				},
+			},
+			[archived],
+		);
+		expect(driver.reserve([archived], "receipt")).toContain("Repair the invalid review packet");
+		expect(archived.outcome).toBe("failed");
+	});
+
+	it.each(["stopped", "unknown"] as const)("archived Workflow %s is not recoverable as a failed step", (outcome) => {
+		const { driver, root } = setup();
+		driver.activate(root.id, "receipt", "user-command");
+		const workflow = { id: "wf-unsafe", status: "archived" as const, createdAt: 1001, outcome };
+		driver.trackWorkflows([workflow]);
+		expect(() =>
+			driver.recordRecovery(
+				root.id,
+				[workflow.id],
+				{
+					nextAction: {
+						key: "unsafe",
+						instruction: "Must not treat a stopped or unknown executor as a processed failure",
+					},
+				},
+				[workflow],
+			),
+		).toThrow("stopped/unknown");
+		expect(driver.reserve([workflow], "receipt")).toBeUndefined();
+		expect(driver.snapshot()?.state).toBe("blocked");
+	});
+
+	it("an acknowledged stopped job still blocks the same grant; only fresh explicit consent can authorize different work", async () => {
+		const { manager, driver, root, storageRoot, time, executions } = setup();
+		driver.activate(root.id, "receipt", "user-command");
+		const job = manager.start({
+			command: "controlled",
+			label: "controlled",
+			cwd: storageRoot,
+			parentTaskId: root.id,
+		});
+		await tick();
+		await manager.stop(job.id);
+		manager.acknowledge(job.id, "Stopped intentionally, effects inspected");
+		expect(driver.reserve([], "receipt")).toBeUndefined();
+		expect(driver.snapshot()?.state).toBe("blocked");
+		time(Date.now() + 1000);
+		manager.updateTask(root.id, undefined, {
+			nextAction: { key: "different", instruction: "Inspect a different artifact; do not rerun the stopped job" },
+		});
+		driver.activate(root.id, "fresh-confirmation", "user-command");
+		expect(driver.reserve([], "fresh-confirmation")).toBeDefined();
+		expect(manager.get(job.id).status).toBe("stopped");
+		expect(executions).toHaveLength(1);
+	});
+
+	it("failed resolution persistence cannot authorize the corrected step", () => {
+		const { manager, driver, root } = setup();
+		driver.activate(root.id, "receipt", "user-command");
+		const workflow = { id: "wf-failed", status: "archived" as const, createdAt: 1001, outcome: "failed" as const };
+		driver.trackWorkflows([workflow]);
+		const failing = vi
+			.spyOn(manager, "continuityPath")
+			.mockReturnValue(join(manager.continuityPath(), "missing", "file"));
+		expect(() =>
+			driver.recordRecovery(
+				root.id,
+				[workflow.id],
+				{
+					nextAction: {
+						key: "fix",
+						instruction: "Correct the independently identified failure before new validation",
+					},
+				},
+				[workflow],
+			),
+		).toThrow();
+		failing.mockRestore();
+		expect(driver.snapshot()?.resolvedFailures).not.toContain(workflow.id);
+		expect(driver.view([workflow]).state).toBe("awaiting_processing");
+		expect(driver.reserve([workflow], "receipt")).toBeUndefined();
 	});
 
 	it("cannot reserve a boundary message if durable accounting cannot be saved", () => {
