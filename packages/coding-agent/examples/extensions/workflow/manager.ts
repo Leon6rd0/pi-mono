@@ -314,9 +314,13 @@ export class WorkflowManager {
 					outcome: "failed",
 					message: `Workflow token budget exhausted at ${error.scope} admission: ${error.message}`,
 				};
-				this.syncBudget(record, runtime);
-				this.save(record);
-				runtime.controller.abort(new Error(runtime.failure.message));
+				try {
+					this.syncBudget(record, runtime);
+					this.save(record);
+				} finally {
+					// A storage failure must not leave independently pending children running.
+					runtime.controller.abort(new Error(runtime.failure.message));
+				}
 				throw error;
 			}
 		}
@@ -472,21 +476,25 @@ export class WorkflowManager {
 									if (!settlement.unknown)
 										request.underestimatedTokens = Math.max(0, usage.totalTokens - request.reservedTokens!);
 									this.syncBudget(record, runtime);
-									this.save(record); // Retain observations/accounting before cancellation.
-									this.wake(runtime);
-									const snapshot = record.budget!;
-									if (
-										this.running.has(record.id) &&
-										((snapshot.overcommittedTokens ?? 0) > 0 ||
-											snapshot.agents.some((scope) => (scope.overcommittedTokens ?? 0) > 0) ||
-											snapshot.phases.some((scope) => (scope.overcommittedTokens ?? 0) > 0))
-									) {
-										runtime.failure = {
-											outcome: "failed",
-											message:
-												"Workflow token budget exhausted; reported usage plus outstanding reservations exceeds a scope limit",
-										};
-										runtime.controller.abort(new Error(runtime.failure.message));
+									try {
+										this.save(record); // Retain observations/accounting before cancellation when possible.
+									} finally {
+										// Persistence errors cannot suppress the already-settled budget guard.
+										this.wake(runtime);
+										const snapshot = record.budget!;
+										if (
+											this.running.has(record.id) &&
+											((snapshot.overcommittedTokens ?? 0) > 0 ||
+												snapshot.agents.some((scope) => (scope.overcommittedTokens ?? 0) > 0) ||
+												snapshot.phases.some((scope) => (scope.overcommittedTokens ?? 0) > 0))
+										) {
+											runtime.failure = {
+												outcome: "failed",
+												message:
+													"Workflow token budget exhausted; reported usage plus outstanding reservations exceeds a scope limit",
+											};
+											runtime.controller.abort(new Error(runtime.failure.message));
+										}
 									}
 								},
 							});

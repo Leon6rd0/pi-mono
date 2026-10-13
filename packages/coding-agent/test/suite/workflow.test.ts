@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import {
+import fs, {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -9,6 +9,7 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, getCurrentTools, type JsonObject } from "@earendil-works/pi-ai";
@@ -31,6 +32,7 @@ import {
 	emptyUsage,
 	type ModelRequestEstimate,
 	type ScriptRunner,
+	type WorkflowRecord,
 } from "../../examples/extensions/workflow/types.ts";
 import { writeOutputFile } from "../../src/utils/output-files.ts";
 import { createHarness, createTestUiContext, getToolResult, type Harness } from "./harness.ts";
@@ -163,6 +165,7 @@ async function ready(_harness: Harness, id: string) {
 
 afterEach(async () => {
 	vi.restoreAllMocks();
+	syncBuiltinESMExports();
 	await Promise.all(extraManagers.splice(0).map((manager) => manager.close()));
 	for (const harness of harnesses.splice(0)) {
 		await harness.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
@@ -325,6 +328,166 @@ describe("independent Workflow (QuickJS and faux/local runners only)", () => {
 		});
 		expect(readFileSync(started.resultPath, "utf8")).toContain("budget exhausted at workflow admission");
 	});
+
+	it.each(["admission", "controlled usage", "native usage"] as const)(
+		"cancels budget siblings despite a metadata rename failure (%s)",
+		async (kind) => {
+			const native = kind === "native usage";
+			const limit = native ? 10000 : 100;
+			let actual: ChildRunner | undefined;
+			let sibling: ChildOptions | undefined;
+			let release: (() => void) | undefined;
+			let primaryFinished = false;
+			const { harness } = await setup(
+				{
+					limits: { maxTotalTokens: limit, maxOutputTokens: 100 },
+					runChild: async (options) => {
+						if (options.request.prompt === "pending") {
+							const id = await options.beforeRequest(mockEstimate);
+							options.onRequestDispatched?.(id);
+							return new Promise<ChildResult>((_resolve, reject) => {
+								options.signal.throwIfAborted();
+								options.signal.addEventListener("abort", () => reject(new Error("sibling cancelled")), {
+									once: true,
+								});
+								sibling = options;
+							});
+						}
+						try {
+							let id: string | undefined;
+							if (kind === "controlled usage") {
+								id = await options.beforeRequest(mockEstimate);
+								options.onRequestDispatched?.(id);
+							}
+							await new Promise<void>((resolve, reject) => {
+								options.signal.throwIfAborted();
+								const abort = () => reject(new Error("primary cancelled before release"));
+								options.signal.addEventListener("abort", abort, { once: true });
+								release = () => {
+									options.signal.removeEventListener("abort", abort);
+									resolve();
+								};
+							});
+							if (native) {
+								if (!actual) throw new Error("Missing native child runner");
+								return await actual(options);
+							}
+							if (kind === "admission") {
+								// Larger than the entire limit: cannot wait for the pending sibling's settlement.
+								await options.beforeRequest({ ...mockEstimate, estimatedInputTokens: limit });
+							} else {
+								options.onUsage({ ...emptyUsage(), output: 120, totalTokens: 120 }, undefined, id!);
+							}
+							throw new Error("Expected the targeted save to throw");
+						} finally {
+							primaryFinished = true;
+						}
+					},
+				},
+				(pi) => {
+					pi.on("session_start", (_event, ctx) => {
+						if (ctx.model) actual = createChildRunner(ctx.modelRegistry, ctx.model, ctx.createChildToolHost);
+					});
+				},
+				mockEstimate,
+				native,
+			);
+			// Existing native Promise API, not the proposed settled helpers: script catch is already supported.
+			const started = await launch(
+				harness,
+				"return await Promise.allSettled([agent('pending'), agent('primary')]);",
+			);
+			await vi.waitFor(() => {
+				expect(sibling).toBeDefined();
+				expect(release).toBeDefined();
+			});
+			expect(sibling!.signal.aborted).toBe(false);
+			const rename = fs.renameSync;
+			let failures = 0;
+			let failure: unknown;
+			vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+				if (destination !== started.resultPath || failures > 0) return rename(source, destination);
+				const pending: WorkflowRecord = JSON.parse(readFileSync(source, "utf8"));
+				// Native progress and admission saves must succeed; fail precisely after usage settlement.
+				if (kind !== "admission" && pending.agents[1].requests?.[0]?.status !== "reported")
+					return rename(source, destination);
+				failures++;
+				const backup = `${started.resultPath}.before-injected-failure`;
+				rename(started.resultPath, backup);
+				mkdirSync(started.resultPath);
+				try {
+					// A real filesystem error, restored synchronously before any sibling cleanup save.
+					return rename(source, destination);
+				} catch (error) {
+					failure = error;
+					throw error;
+				} finally {
+					rmSync(started.resultPath, { recursive: true });
+					rename(backup, started.resultPath);
+				}
+			});
+			syncBuiltinESMExports();
+			if (native) harness.setResponses([fauxAssistantMessage("x".repeat(48000))]);
+			release!();
+			await vi.waitFor(() => expect(primaryFinished).toBe(true));
+			expect(failures).toBe(1);
+			expect(failure).toMatchObject({ syscall: "rename", dest: started.resultPath });
+			// Assert before any explicit stop, deadline, sibling release or new admission can mask the leak.
+			expect(sibling!.signal.aborted, "budget abort must survive the targeted metadata failure").toBe(true);
+			await ready(harness, started.workflow.id);
+			const record: WorkflowRecord = JSON.parse(readFileSync(started.resultPath, "utf8"));
+			expect(record.outcome).toBe("failed");
+			expect(record.error).toContain("token budget exhausted");
+			expect(record.deliveryComplete).toBe(false);
+			expect(record.agents[0].requests).toMatchObject([{ status: "unknown", reservedTokens: 1 }]);
+			if (kind === "admission") {
+				expect(record.agents[1]).toMatchObject({ turns: 0, requests: [] });
+				expect(record.usage.totalTokens).toBe(0);
+			} else {
+				expect(record.agents[1]).toMatchObject({ turns: 1, requests: [{ status: "reported" }] });
+				expect(record.usage.totalTokens).toBeGreaterThan(limit);
+				if (native) expect(harness.getPendingResponseCount()).toBe(0);
+			}
+			expect(record.budget).toMatchObject({ reservedTokens: 1, unknownTokens: 1 });
+		},
+	);
+
+	it.each(["write", "rename"] as const)(
+		"does not promote a below-budget callback save failure into budget cancellation (%s)",
+		async (kind) => {
+			const { harness, executions } = await setup({ limits: { maxTotalTokens: 100 } });
+			const started = await launch(harness, "return await parallel([()=>agent('one'),()=>agent('two')]);");
+			await vi.waitFor(() => expect(executions).toHaveLength(2));
+			const target = kind === "write" ? dirname(started.resultPath) : started.resultPath;
+			const backup = `${target}.before-below-budget-failure`;
+			renameSync(target, backup);
+			try {
+				if (kind === "rename") mkdirSync(target);
+				// Exercise the trusted callback directly: the controlled producer remains pending after this error.
+				expect(() =>
+					executions[0].options.onUsage(
+						{ ...emptyUsage(), output: 20, totalTokens: 20 },
+						undefined,
+						executions[0].requestId,
+					),
+				).toThrow();
+				expect(executions.map((execution) => execution.options.signal.aborted)).toEqual([false, false]);
+			} finally {
+				if (kind === "rename") rmSync(target, { recursive: true });
+				renameSync(backup, target);
+			}
+			// The first report already settled in memory. Identical reporting must not charge it again.
+			executions[0].complete("one", 20);
+			executions[1].complete("two", 12);
+			await ready(harness, started.workflow.id);
+			expect(JSON.parse(readFileSync(started.resultPath, "utf8"))).toMatchObject({
+				outcome: "completed",
+				deliveryComplete: true,
+				usage: { totalTokens: 32 },
+				budget: { reservedTokens: 0, unknownTokens: 0, overcommittedTokens: 0 },
+			});
+		},
+	);
 
 	it("unknown usage keeps its debit and wakes a blocked admission into explicit failure, not another call", async () => {
 		const { harness, executions } = await setup({ limits: { maxTotalTokens: 100 } }, undefined, {
