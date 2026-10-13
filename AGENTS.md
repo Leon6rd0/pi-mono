@@ -12,6 +12,13 @@
 - When the user asks a question, answer it first before making edits or running implementation commands.
 - When responding to user feedback or an analysis, explicitly say whether you agree or disagree before saying what you changed.
 
+## Pi Workflow / Continuity Project
+
+- Goal: improve GPT coding and sustained project execution in Pi toward the Claude Code experience, not feature-count parity. Priorities are Workflow, project-centred automatic compaction, and engineering/grounded delivery.
+- Keep the Pi harness thin: text-driven orchestration in extensions, with only necessary deterministic execution protections. Reuse existing interfaces before extending core; do not build a second platform in extensions either.
+- Prefer existing Markdown/JSON/JSONL plans, session records and logs; UI is a view, and persisted text is not execution approval.
+- Follow the [project rules and active plan](packages/coding-agent/docs/workflow-engineering-plan.md#project-rules-and-active-plan-2026-10-13). Keep units and reviews bounded, reuse valid evidence and stop at agreed acceptance. This does not waive the Commands/Git requirements below or expand permissions, budgets or deployment scope.
+
 ## Code Quality
 
 - Read files in full before wide-ranging changes, before editing files you have not fully inspected, and when asked to investigate or audit. Do not rely on search snippets for broad changes.
