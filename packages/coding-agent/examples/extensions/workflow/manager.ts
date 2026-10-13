@@ -169,12 +169,14 @@ export class WorkflowManager {
 			/* UI cannot change execution outcomes. */
 		}
 	}
-	private save(record: WorkflowRecord): void {
-		record.updatedAt = Date.now();
+	private save(record: WorkflowRecord, changes: Partial<WorkflowRecord> = {}): void {
+		const saved = { ...record, ...changes, updatedAt: Date.now() };
 		const path = join(this.directory, `${record.id}.json`);
 		const temporary = `${path}.${randomUUID()}.tmp`;
-		writeFileSync(temporary, JSON.stringify(record), { mode: 0o600 });
+		writeFileSync(temporary, JSON.stringify(saved), { mode: 0o600 });
 		renameSync(temporary, path);
+		// Commit pending fields only after persistence, without replacing late callbacks' owner.
+		Object.assign(record, saved);
 		this.records.set(record.id, record);
 		this.changed();
 	}
@@ -681,12 +683,10 @@ export class WorkflowManager {
 		if (record.status !== "awaiting_result" && record.status !== "archived")
 			throw new Error("Workflow result is not ready; do not wait or poll");
 		const usage = reportUsage && !record.usageReported ? structuredClone(record.usage) : undefined;
-		record.resultRead = true;
-		if (reportUsage && !record.usageReported) {
-			record.usageReported = true;
-			record.usageReportedTokens = record.usage.totalTokens;
-		}
-		this.save(record);
+		this.save(record, {
+			resultRead: true,
+			...(usage ? { usageReported: true, usageReportedTokens: usage.totalTokens } : {}),
+		});
 		return { workflow: this.get(id), usage };
 	}
 	acknowledge(id: string, summary: string): WorkflowRecord {
@@ -697,10 +697,7 @@ export class WorkflowManager {
 		if (record.status === "archived") return this.get(id);
 		if (record.status !== "awaiting_result" || !record.resultRead)
 			throw new Error("Read the ready result with workflow result, process it, then acknowledge");
-		record.status = "archived";
-		record.acknowledgedAt = Date.now();
-		record.acknowledgement = summary;
-		this.save(record);
+		this.save(record, { status: "archived", acknowledgedAt: Date.now(), acknowledgement: summary });
 		return this.get(id);
 	}
 	close(): Promise<void> {

@@ -522,6 +522,32 @@ describe("independent Workflow (QuickJS and faux/local runners only)", () => {
 		expect((await call(harness, { action: "list" })).details).toEqual({ workflows: [] });
 	});
 
+	it.each([100, 13000])(
+		"command result labels display truncation without consuming model-tool usage (%i chars)",
+		async (length) => {
+			const { harness, executions, notices } = await setup();
+			const started = await launch(harness);
+			await vi.waitFor(() => expect(executions).toHaveLength(1));
+			executions[0].complete(`${"x".repeat(length)}RETAINED_TAIL`);
+			await ready(harness, started.workflow.id);
+			await harness.session.prompt(`/workflow result ${started.workflow.id}`);
+			const display = notices.find((text) => text.includes(`"id": "${started.workflow.id}"`));
+			expect(display).toBeDefined();
+			if (length > 12000) {
+				expect(display).toContain("Display truncated; full retained record:");
+				expect(display).toContain(started.resultPath);
+				expect(display).not.toContain("RETAINED_TAIL");
+			} else {
+				expect(display).not.toContain("Display truncated");
+				expect(display).toContain("RETAINED_TAIL");
+			}
+			expect(readFileSync(started.resultPath, "utf8")).toContain("RETAINED_TAIL");
+			const result = await call(harness, { action: "result", id: started.workflow.id });
+			expect(result.usage?.totalTokens).toBe(12);
+			expect(result.details).toMatchObject({ workflow: { deliveryComplete: true } });
+		},
+	);
+
 	it("exposes child and script output truncation instead of implying complete delivery", async () => {
 		const { harness, executions } = await setup();
 		const started = await launch(

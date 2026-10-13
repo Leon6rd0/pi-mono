@@ -409,7 +409,13 @@ export function createWorkflowExtension(options: WorkflowOptions = {}): Extensio
 						else if (action === "ack") current.acknowledge(id, rest.join(" "));
 						else if (action === "result") {
 							const record = current.result(id, false).workflow;
-							ctx.ui.notify(safeText(JSON.stringify(record, null, 2)).slice(0, 12000), "info");
+							const text = safeText(JSON.stringify(record, null, 2));
+							ctx.ui.notify(
+								text.length > 12000
+									? `${text.slice(0, 12000)}\n[Display truncated; full retained record: ${safeText(current.recordPath(id))}]`
+									: text,
+								"info",
+							);
 						} else ctx.ui.notify(JSON.stringify(summary(current.get(id)), null, 2), "info");
 					} else
 						ctx.ui.notify(
