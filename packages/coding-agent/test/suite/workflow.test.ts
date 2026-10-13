@@ -2,18 +2,20 @@ import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, getCurrentTools, type JsonObject } from "@earendil-works/pi-ai";
-import { type ExtensionAPI, initTheme } from "@earendil-works/pi-coding-agent";
+import { createCodemodeExtension, type ExtensionAPI, initTheme, SessionManager } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createChildRunner, workspacePath } from "../../examples/extensions/workflow/child-agent.ts";
 import { createWorkflowExtension, type WorkflowOptions } from "../../examples/extensions/workflow/index.ts";
 import { WorkflowManager } from "../../examples/extensions/workflow/manager.ts";
+import { createScriptRunner } from "../../examples/extensions/workflow/script.ts";
 import {
 	type ChildOptions,
 	type ChildResult,
 	type ChildRunner,
 	emptyUsage,
 	type ModelRequestEstimate,
+	type ScriptRunner,
 } from "../../examples/extensions/workflow/types.ts";
 import { createHarness, createTestUiContext, getToolResult, type Harness } from "./harness.ts";
 
@@ -144,6 +146,7 @@ async function ready(_harness: Harness, id: string) {
 }
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	await Promise.all(extraManagers.splice(0).map((manager) => manager.close()));
 	for (const harness of harnesses.splice(0)) {
 		await harness.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
@@ -730,6 +733,98 @@ describe("independent Workflow (QuickJS and faux/local runners only)", () => {
 			"failed",
 		);
 	});
+
+	it.each([false, true])(
+		"isolates script stores without changing ordinary Codemode (frozen context=%s)",
+		async (frozen) => {
+			let actual: ScriptRunner | undefined;
+			const options: WorkflowOptions = frozen
+				? {
+						runScript: (code, ctx, signal) => {
+							if (!actual) throw new Error("Missing real script adapter");
+							// A frozen, populated parent view has an own non-configurable method.
+							// Overriding it through a Proxy would violate the language's invariants.
+							const view = SessionManager.inMemory(
+								ctx.cwd,
+								undefined,
+								structuredClone([ctx.sessionManager.getHeader()!, ...ctx.sessionManager.getBranch()]),
+							);
+							Object.defineProperty(view, "getBranch", { value: view.getBranch.bind(view) });
+							return actual(code, Object.freeze({ ...ctx, sessionManager: Object.freeze(view) }), signal);
+						},
+					}
+				: {};
+			const { harness, executions } = await setup(options, (pi) => {
+				createCodemodeExtension({ mode: "on", models: false })(pi);
+				if (frozen) actual = createScriptRunner(pi);
+			});
+			harness.session.setActiveToolsByName(["workflow", "codemode"]);
+			const parentStore = { set: { parent_secret: "PARENT_STORE_PRIVATE_SENTINEL" }, delete: [] };
+			harness.sessionManager.appendCustomEntry("codemode-store", parentStore);
+			const sessions: SessionManager[] = [];
+			const inMemory = SessionManager.inMemory;
+			vi.spyOn(SessionManager, "inMemory").mockImplementation((...args) => {
+				const session = inMemory(...args);
+				sessions.push(session);
+				return session;
+			});
+			const first = await launch(
+				harness,
+				"const inherited=load('parent_secret') ?? null; store('parent_secret','CHILD_ONLY'); store('workflow_local',17); return {inherited,local:load('workflow_local'),own:load('parent_secret')};",
+			);
+			await ready(harness, first.workflow.id);
+			const firstRecord = JSON.parse(readFileSync(first.resultPath, "utf8"));
+			expect(firstRecord).toMatchObject({ outcome: "completed", agents: [], usage: { totalTokens: 0 } });
+			expect(firstRecord.result).toContain('"inherited":null');
+			expect(firstRecord.result).toContain('"local":17');
+			expect(firstRecord.result).toContain('"own":"CHILD_ONLY"');
+			expect(JSON.stringify(firstRecord)).not.toContain("PARENT_STORE_PRIVATE_SENTINEL");
+			const second = await launch(
+				harness,
+				"return {parent:load('parent_secret') ?? null,previous:load('workflow_local') ?? null};",
+			);
+			await ready(harness, second.workflow.id);
+			const secondRecord = JSON.parse(readFileSync(second.resultPath, "utf8"));
+			expect(secondRecord).toMatchObject({ outcome: "completed", agents: [], usage: { totalTokens: 0 } });
+			expect(secondRecord.result).toContain('{"parent":null,"previous":null}');
+			expect(executions).toHaveLength(0);
+			expect(sessions).toHaveLength(frozen ? 4 : 2); // Frozen fixtures plus one fresh owner per script.
+			for (const session of sessions) {
+				expect(session.isPersisted()).toBe(false);
+				expect(session.getSessionFile()).toBeUndefined();
+				expect(session.getSessionDir()).toBe("");
+				expect(session).not.toBe(harness.sessionManager);
+			}
+			expect(sessions.filter((session) => session.getEntries().length === 0)).toHaveLength(2);
+			expect(
+				harness.sessionManager
+					.getBranch()
+					.filter((entry) => entry.type === "custom" && entry.customType === "codemode-store"),
+			).toMatchObject([{ data: parentStore }]);
+
+			// Positive control through the ordinary, separately registered Codemode tool.
+			harness.setResponses([
+				fauxAssistantMessage(
+					fauxToolCall("codemode", {
+						code: "store('normal_written',42); return [load('parent_secret'),load('workflow_local') ?? null];",
+					}),
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage("Normal store preserved."),
+			]);
+			await harness.session.prompt("Use the normal main-session store");
+			const normal = getToolResult(harness, "codemode");
+			expect(normal.isError).toBe(false);
+			expect(JSON.stringify(normal.content)).toContain("PARENT_STORE_PRIVATE_SENTINEL");
+			expect(
+				harness.sessionManager
+					.getBranch()
+					.filter((entry) => entry.type === "custom" && entry.customType === "codemode-store"),
+			).toMatchObject([{ data: parentStore }, { data: { set: { normal_written: 42 }, delete: [] } }]);
+			expect(harness.faux.state.callCount).toBe(6);
+			expect(harness.getPendingResponseCount()).toBe(0);
+		},
+	);
 
 	it("validates write policy and allows the launch permission hook to block before execution", async () => {
 		const { harness, executions } = await setup({}, (pi) => {

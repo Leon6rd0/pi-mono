@@ -166,7 +166,10 @@ Scripts have no Node, filesystem, network or timers. Only the validated
 `workflow_agent` and `workflow_control` bridge tools are exposed. Script helpers
 are ordinary VM functions, not unrestricted host JavaScript callbacks. The host's
 existing codemode runtime resolves its own worker/wasm assets; model discovery,
-parent tools and parent codemode store are not exposed. Store writes are discarded.
+parent tools and parent codemode store are not exposed. Each script gets a fresh
+in-memory session owner, not the parent's session branch. `store()`/`load()` work
+within that script, but writes are discarded afterward and are not inherited by
+another Workflow. Ordinary main-session Codemode keeps its existing persistent store.
 
 ## Agent backlog and controls
 

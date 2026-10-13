@@ -1,4 +1,9 @@
-import { createCodemodeExtension, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+	createCodemodeExtension,
+	type ExtensionAPI,
+	SessionManager,
+	type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import type { ScriptRunner } from "./types.ts";
 
 /** Reuse the public codemode extension so source/npm/compiled hosts resolve their own worker and wasm assets. */
@@ -21,7 +26,10 @@ export function createScriptRunner(pi: ExtensionAPI): ScriptRunner {
 	const tool = definition;
 	if (!tool) throw new Error("Host did not register the codemode runtime");
 	return async (code, ctx, signal) => {
-		const result = await tool.execute("workflow-script", { code }, signal, undefined, ctx);
+		// Disabling appendEntry only blocks writes; Codemode still reads its supplied branch.
+		// A fresh non-persisting owner keeps parent history/store out without mutating parent ctx.
+		const context = { ...ctx, sessionManager: SessionManager.inMemory(ctx.cwd) };
+		const result = await tool.execute("workflow-script", { code }, signal, undefined, context);
 		const details = result.details;
 		// Codemode exposes a spill path, but no truncation flag on failed spill. Its
 		// warning is a conservative fallback: a script quoting it may be marked partial,
