@@ -1180,8 +1180,14 @@ export class ExtensionRunner {
 		return modified ? currentMessage : undefined;
 	}
 
-	async emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined> {
-		const ctx = this.createContext();
+	/** A host-owned independent call may select its context and require filtering to fail closed. */
+	async emitToolResult(
+		event: ToolResultEvent,
+		options: { context?: ExtensionContext; failClosed?: boolean } = {},
+	): Promise<ToolResultEventResult | undefined> {
+		const ctx = options.context ?? this.createContext();
+		if (options.context || options.failClosed) this.assertActive();
+		if (options.failClosed) ctx.signal?.throwIfAborted();
 		const currentEvent: ToolResultEvent = { ...event };
 		let modified = false;
 
@@ -1189,6 +1195,10 @@ export class ExtensionRunner {
 			for (const handler of handlers) {
 				try {
 					const handlerResult = (await handler(currentEvent, ctx)) as ToolResultEventResult | undefined;
+					if (options.failClosed) {
+						this.assertActive();
+						ctx.signal?.throwIfAborted();
+					}
 					if (!handlerResult) continue;
 
 					if (handlerResult.content !== undefined) {
@@ -1214,14 +1224,19 @@ export class ExtensionRunner {
 						modified = true;
 					}
 				} catch (err) {
-					const message = err instanceof Error ? err.message : String(err);
-					const stack = err instanceof Error ? err.stack : undefined;
+					const message = options.failClosed
+						? "Tool result policy failed"
+						: err instanceof Error
+							? err.message
+							: String(err);
+					const stack = !options.failClosed && err instanceof Error ? err.stack : undefined;
 					this.emitError({
 						extensionPath: ext.path,
 						event: "tool_result",
 						error: message,
 						stack,
 					});
+					if (options.failClosed) throw new Error(message);
 				}
 			}
 		}
@@ -1239,13 +1254,22 @@ export class ExtensionRunner {
 		};
 	}
 
-	async emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined> {
-		const ctx = this.createContext();
+	/** The supplied context is constructed by the host, never inferred from model arguments. */
+	async emitToolCall(event: ToolCallEvent, context?: ExtensionContext): Promise<ToolCallEventResult | undefined> {
+		const ctx = context ?? this.createContext();
+		if (context) {
+			this.assertActive();
+			ctx.signal?.throwIfAborted();
+		}
 		let result: ToolCallEventResult | undefined;
 
 		for (const { handlers } of snapshotEventHandlers(this.extensions, "tool_call")) {
 			for (const handler of handlers) {
 				const handlerResult = await handler(event, ctx);
+				if (context) {
+					this.assertActive();
+					ctx.signal?.throwIfAborted();
+				}
 
 				if (handlerResult) {
 					result = handlerResult as ToolCallEventResult;

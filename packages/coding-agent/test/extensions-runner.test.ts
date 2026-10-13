@@ -18,10 +18,13 @@ import {
 import { ExtensionRunner, emitProjectTrustEvent } from "../src/core/extensions/runner.ts";
 import type {
 	ExtensionActions,
+	ExtensionContext,
 	ExtensionContextActions,
 	ExtensionFactory,
 	ExtensionUIContext,
 	ProviderConfig,
+	ToolCallEvent,
+	ToolResultEvent,
 } from "../src/core/extensions/types.ts";
 import { KeybindingsManager, type KeyId } from "../src/core/keybindings.ts";
 import type { ModelRegistry } from "../src/core/model-registry.ts";
@@ -1052,6 +1055,125 @@ describe("ExtensionRunner", () => {
 
 			expect(result.entries).toMatchObject([{ type: "custom", customType: "kept" }]);
 			expect(errors).toEqual(["boundary failed"]);
+		});
+	});
+
+	describe("host-owned tool policy context", () => {
+		const call: ToolCallEvent = {
+			type: "tool_call",
+			toolName: "read",
+			toolCallId: "independent/read-1",
+			input: { path: "file.txt" },
+		};
+		const resultEvent: ToolResultEvent = {
+			type: "tool_result",
+			toolName: "read",
+			toolCallId: call.toolCallId,
+			input: call.input,
+			content: [{ type: "text", text: "unfiltered" }],
+			structuredContent: { secret: "unfiltered" },
+			details: {},
+			isError: false,
+		};
+
+		async function policyRunner(factory: ExtensionFactory) {
+			const runtime = createExtensionRuntime();
+			const extension = await loadExtensionFromFactory(factory, tempDir, createEventBus(), runtime);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			runner.bindCore(extensionActions, extensionContextActions);
+			return runner;
+		}
+
+		it("uses the supplied cwd/signal for both hooks without rebinding the parent context", async () => {
+			const child = new AbortController();
+			const parent = new AbortController();
+			const observed: ExtensionContext[] = [];
+			const runner = await policyRunner((pi) => {
+				pi.on("tool_call", (_event, ctx) => {
+					observed.push(ctx);
+					if (ctx.signal === child.signal) return { block: true, reason: "child denied" };
+				});
+				pi.on("tool_result", (_event, ctx) => {
+					observed.push(ctx);
+					return { content: [{ type: "text", text: ctx.cwd }] };
+				});
+			});
+			runner.bindCore(extensionActions, { ...extensionContextActions, getSignal: () => parent.signal });
+			const context = { ...runner.createContext(), cwd: path.join(tempDir, "child"), signal: child.signal };
+			parent.abort();
+			await expect(runner.emitToolCall(call, context)).resolves.toEqual({ block: true, reason: "child denied" });
+			const filtered = await runner.emitToolResult(resultEvent, { context, failClosed: true });
+			expect(filtered?.content).toEqual([{ type: "text", text: context.cwd }]);
+			expect(filtered?.structuredContent).toBeUndefined();
+			expect(observed).toEqual([context, context]);
+			await expect(runner.emitToolCall(call)).resolves.toBeUndefined();
+			expect(observed[2].cwd).toBe(tempDir);
+			expect(observed[2].signal).toBe(parent.signal);
+			expect(child.signal.aborted).toBe(false);
+		});
+
+		it("fails closed without leaking a filter exception, while default dispatch still isolates errors", async () => {
+			const later = vi.fn(() => ({ content: [{ type: "text" as const, text: "later" }] }));
+			const runner = await policyRunner((pi) => {
+				pi.on("tool_result", () => ({ content: [{ type: "text", text: "partial" }] }));
+				pi.on("tool_result", () => {
+					throw new Error("FILTER_PRIVATE_SENTINEL");
+				});
+				pi.on("tool_result", later);
+			});
+			const errors: unknown[] = [];
+			runner.onError((error) => errors.push(error));
+			const failure = await runner
+				.emitToolResult(resultEvent, { failClosed: true })
+				.catch((error: unknown) => error);
+			expect(failure).toBeInstanceOf(Error);
+			expect((failure as Error).message).toBe("Tool result policy failed");
+			expect((failure as Error).cause).toBeUndefined();
+			expect(JSON.stringify(errors)).not.toContain("FILTER_PRIVATE_SENTINEL");
+			expect(later).not.toHaveBeenCalled();
+			expect(resultEvent.content).toEqual([{ type: "text", text: "unfiltered" }]);
+			const filtered = await runner.emitToolResult(resultEvent);
+			expect(filtered?.content).toEqual([{ type: "text", text: "later" }]);
+			expect(later).toHaveBeenCalledOnce();
+			expect(JSON.stringify(errors)).toContain("FILTER_PRIVATE_SENTINEL");
+		});
+
+		it.each([
+			["tool_call", "abort"],
+			["tool_call", "invalidate"],
+			["tool_result", "abort"],
+			["tool_result", "invalidate"],
+		] as const)("rejects %s after %s during an awaited handler", async (kind, stop) => {
+			let release!: () => void;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const child = new AbortController();
+			const later = vi.fn();
+			const runner = await policyRunner((pi) => {
+				pi.on("tool_call", async () => {
+					await gate;
+				});
+				pi.on("tool_call", () => {
+					later();
+				});
+				pi.on("tool_result", async () => {
+					await gate;
+				});
+				pi.on("tool_result", () => {
+					later();
+				});
+			});
+			const context = { ...runner.createContext(), signal: child.signal };
+			const pending =
+				kind === "tool_call"
+					? runner.emitToolCall(call, context)
+					: runner.emitToolResult(resultEvent, { context, failClosed: true });
+			if (stop === "abort") child.abort();
+			else runner.invalidate();
+			release();
+			await expect(pending).rejects.toThrow();
+			expect(later).not.toHaveBeenCalled();
 		});
 	});
 
