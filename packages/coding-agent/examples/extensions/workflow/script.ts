@@ -69,4 +69,33 @@ async function pipeline(items, mapper, options = {}) {
   }));
   return results;
 }
+// Keep the shared projection private; only the two explicit helpers enter script scope.
+const [parallelSettled, pipelineSettled] = (() => {
+  async function settle(invoke) {
+    try {
+      return {status: "fulfilled", value: await invoke()};
+    } catch (error) {
+      let reason = "Unprintable rejection";
+      try { reason = String(error); } catch {}
+      return {status: "rejected", reason: reason.slice(0, 2000), reasonTruncated: reason.length > 2000};
+    }
+  }
+  return [
+    async (tasks) => {
+      const size = Array.isArray(tasks) ? tasks.length : -1;
+      if (!Number.isInteger(size) || size < 0 || size > 32) throw new Error("parallelSettled expects at most 32 functions or prompts");
+      return Promise.all(Array.from({length: size}, (_, i) => settle(() => {
+        const task = tasks[i];
+        return typeof task === "function" ? task() : agent(task);
+      })));
+    },
+    async (items, mapper, options = {}) => {
+      const size = Array.isArray(items) ? items.length : -1;
+      if (!Number.isInteger(size) || size < 0 || size > 32 || typeof mapper !== "function") throw new Error("pipelineSettled expects at most 32 items and a mapper");
+      // Reuse the existing bounded loop over fixed positions, not a second scheduler.
+      return pipeline(Array.from({length: size}, (_, i) => i),
+        i => settle(() => mapper(items[i], i)), options);
+    }
+  ];
+})();
 `;

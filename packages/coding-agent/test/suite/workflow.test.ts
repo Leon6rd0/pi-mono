@@ -51,6 +51,7 @@ interface Execution {
 	options: ChildOptions;
 	requestId: string;
 	complete(output: string, tokens?: number): void;
+	fail(error: Error): void;
 }
 async function setup(
 	options: WorkflowOptions = {},
@@ -72,6 +73,10 @@ async function setup(
 			executions.push({
 				options,
 				requestId,
+				fail: (error) => {
+					options.signal.removeEventListener("abort", abort);
+					reject(error);
+				},
 				complete: (output, tokens = 12) => {
 					options.signal.removeEventListener("abort", abort);
 					const usage = emptyUsage();
@@ -1074,6 +1079,313 @@ describe("independent Workflow (QuickJS and faux/local runners only)", () => {
 		expect(readFileSync(started.logPath, "utf8")).toContain("Agent completed");
 		expect(readFileSync(started.resultPath, "utf8")).toContain("Read findings");
 		expect((await call(harness, { action: "resume", id: started.workflow.id })).isError).toBe(true);
+	});
+
+	it("parallelSettled catches sync and async failures, awaits pending work and retains input order", async () => {
+		const { harness } = await setup();
+		const started = await launch(
+			harness,
+			`
+			let release;
+			const pending = new Promise(resolve => { release = resolve; });
+			const seen = [];
+			const rows = await parallelSettled([
+				() => { seen.push(0); return pending; },
+				() => { seen.push(1); throw new Error('sync'); },
+				() => { seen.push(2); return Promise.reject('async'); },
+				() => { seen.push(3); release(42); return undefined; }
+			]);
+			return {seen, rows};
+		`,
+		);
+		await ready(harness, started.workflow.id);
+		const record: WorkflowRecord = JSON.parse(readFileSync(started.resultPath, "utf8"));
+		expect(record).toMatchObject({ outcome: "completed", deliveryComplete: true, agents: [] });
+		expect(record.result).toContain(
+			JSON.stringify({
+				seen: [0, 1, 2, 3],
+				rows: [
+					{ status: "fulfilled", value: 42 },
+					{ status: "rejected", reason: "Error: sync", reasonTruncated: false },
+					{ status: "rejected", reason: "async", reasonTruncated: false },
+					{ status: "fulfilled" }, // Existing JSON serialization omits undefined, not a synthetic null.
+				],
+			}),
+		);
+	});
+
+	it.each([1, 4])("pipelineSettled continues each worker after failures (concurrency=%i)", async (concurrency) => {
+		const { harness } = await setup();
+		const started = await launch(
+			harness,
+			`
+			const seen = [];
+			const rows = await pipelineSettled([0,1,2,3,4,5], (value, index) => {
+				seen.push(index);
+				if (index === 0) throw 'sync';
+				if (index === 1) return Promise.reject('async');
+				return Promise.resolve(value * 2);
+			}, {concurrency:${concurrency}});
+			let active = 0, maximum = 0;
+			await pipelineSettled([0,1,2,3,4,5], async () => {
+				active++; maximum = Math.max(maximum, active);
+				await Promise.resolve();
+				active--;
+			}, {concurrency:${concurrency}});
+			return {seen:seen.sort(), rows, maximum};
+		`,
+		);
+		await ready(harness, started.workflow.id);
+		const record: WorkflowRecord = JSON.parse(readFileSync(started.resultPath, "utf8"));
+		expect(record.outcome).toBe("completed");
+		expect(record.result).toContain(
+			JSON.stringify({
+				seen: [0, 1, 2, 3, 4, 5],
+				rows: [
+					{ status: "rejected", reason: "sync", reasonTruncated: false },
+					{ status: "rejected", reason: "async", reasonTruncated: false },
+					...[4, 6, 8, 10].map((value) => ({ status: "fulfilled", value })),
+				],
+				maximum: concurrency,
+			}),
+		);
+	});
+
+	it.each(["parallel", "pipeline"])("keeps default %s synchronous fail-fast invocation", async (helper) => {
+		const { harness } = await setup();
+		const invoke =
+			helper === "parallel" ? "parallel(items.map(i => () => visit(i)))" : "pipeline(items, visit, {concurrency:1})";
+		const started = await launch(
+			harness,
+			`
+			const seen = [], items = [0,1,2];
+			const visit = i => { seen.push(i); if (i === 1) throw 'ordinary'; return i; };
+			let caught = false;
+			try { await ${invoke}; } catch { caught = true; }
+			return {seen, caught};
+		`,
+		);
+		await ready(harness, started.workflow.id);
+		const record: WorkflowRecord = JSON.parse(readFileSync(started.resultPath, "utf8"));
+		expect(record.outcome).toBe("completed");
+		expect(record.result).toContain('{"seen":[0,1],"caught":true}');
+	});
+
+	it("settled helpers validate bounds and the original mapper before starting work", async () => {
+		const { harness } = await setup();
+		const started = await launch(
+			harness,
+			`
+			let invoked = 0;
+			const visit = () => { invoked++; };
+			const invalid = [
+				() => parallelSettled(null),
+				() => parallelSettled(Array(33).fill(visit)),
+				() => pipelineSettled(null, visit),
+				() => pipelineSettled(Array(33), visit),
+				() => pipelineSettled([], null),
+				() => pipelineSettled([1], 'not a function'),
+				...[0,5,1.5].map(concurrency => () => pipelineSettled([1], visit, {concurrency}))
+			];
+			const rejected = [];
+			for (const invoke of invalid) {
+				try { await invoke(); rejected.push(false); } catch { rejected.push(true); }
+			}
+			const empty = [await parallelSettled([]), await pipelineSettled([], visit)];
+			const full = await parallelSettled(Array.from({length:32}, (_,i) => () => i));
+			const mapped = await pipelineSettled(Array.from({length:32}, (_,i) => i), (x,i) => x === i);
+			return {rejected, invoked, empty, length:full.length, last:full[31], mapped: mapped.every(r => r.status === 'fulfilled' && r.value)};
+		`,
+		);
+		await ready(harness, started.workflow.id);
+		const record: WorkflowRecord = JSON.parse(readFileSync(started.resultPath, "utf8"));
+		expect(record).toMatchObject({ outcome: "completed", agents: [] });
+		expect(record.result).toContain(
+			JSON.stringify({
+				rejected: Array(9).fill(true),
+				invoked: 0,
+				empty: [[], []],
+				length: 32,
+				last: { status: "fulfilled", value: 31 },
+				mapped: true,
+			}),
+		);
+	});
+
+	it("settled helpers bound positions and collect indexed access errors including sparse inputs", async () => {
+		const { harness } = await setup();
+		const started = await launch(
+			harness,
+			`
+			const tasks = [() => { tasks.push(() => 99); return 0; }, null, () => 2];
+			Object.defineProperty(tasks, '1', {get() { throw 'getter'; }});
+			const a = await parallelSettled(tasks);
+			const sparse = await parallelSettled(new Array(1));
+			const items = [0,1,2];
+			Object.defineProperty(items, '1', {get() { throw 'getter'; }});
+			const b = await pipelineSettled(items, (x,i) => { if (i===0) items.push(99); return x; }, {concurrency:1});
+			return {a, b, sparse: sparse.map(row => row.status)};
+		`,
+		);
+		await ready(harness, started.workflow.id);
+		const record: WorkflowRecord = JSON.parse(readFileSync(started.resultPath, "utf8"));
+		const rows = [
+			{ status: "fulfilled", value: 0 },
+			{ status: "rejected", reason: "getter", reasonTruncated: false },
+			{ status: "fulfilled", value: 2 },
+		];
+		expect(record).toMatchObject({ outcome: "completed", agents: [] });
+		expect(record.result).toContain(JSON.stringify({ a: rows, b: rows, sparse: ["rejected"] }));
+	});
+
+	it("settled rejection reasons are bounded strings, not stack/cause or trusted stop markers", async () => {
+		const { harness } = await setup();
+		const started = await launch(
+			harness,
+			`
+			return await parallelSettled([
+				() => { throw 'x'.repeat(2001); },
+				() => { throw {toString() { throw 'conversion failed'; }}; },
+				() => { throw new Error('Workflow token budget exhausted'); },
+				() => { throw {toString() { return 'plain'; }, get stack() { throw 'stack accessed'; }, get cause() { throw 'cause accessed'; }}; },
+				() => { throw undefined; }
+			]);
+		`,
+		);
+		await ready(harness, started.workflow.id);
+		const record: WorkflowRecord = JSON.parse(readFileSync(started.resultPath, "utf8"));
+		expect(record).toMatchObject({
+			outcome: "completed",
+			deliveryComplete: true,
+			resultTruncated: false,
+			agents: [],
+		});
+		expect(record.result).toContain(
+			JSON.stringify([
+				{ status: "rejected", reason: "x".repeat(2000), reasonTruncated: true },
+				{ status: "rejected", reason: "Unprintable rejection", reasonTruncated: false },
+				{ status: "rejected", reason: "Error: Workflow token budget exhausted", reasonTruncated: false },
+				{ status: "rejected", reason: "plain", reasonTruncated: false },
+				{ status: "rejected", reason: "undefined", reasonTruncated: false },
+			]),
+		);
+	});
+
+	it.each(["cycle", "BigInt"])(
+		"settled successful values still follow final serialization rules (%s)",
+		async (kind) => {
+			const { harness } = await setup();
+			const value = kind === "cycle" ? "const value = {}; value.self = value;" : "const value = 1n;";
+			const started = await launch(
+				harness,
+				`${value} const rows = await parallelSettled([() => value]); text(rows[0].status); return rows;`,
+			);
+			await ready(harness, started.workflow.id);
+			const record: WorkflowRecord = JSON.parse(readFileSync(started.resultPath, "utf8"));
+			expect(record).toMatchObject({ outcome: "failed", deliveryComplete: false, agents: [] });
+			expect(record.result).toContain("fulfilled");
+			expect(record.result).toContain("Script error:");
+		},
+	);
+
+	it.each(["parallelSettled", "pipelineSettled"])(
+		"%s preserves pending/queued siblings after an ordinary child failure",
+		async (helper) => {
+			const { harness, executions } = await setup({ limits: { concurrency: 2 } });
+			const invoke =
+				helper === "parallelSettled"
+					? "parallelSettled(['good', () => agent('bad'), 'queued'])"
+					: "pipelineSettled(['good','bad','queued'], item => agent(item), {concurrency:2})";
+			const started = await launch(
+				harness,
+				`
+			const rows = await ${invoke};
+			return rows.map(r => r.status === 'fulfilled' ? r.value.output : {status:r.status,ordinary:r.reason.includes('ordinary child failure'),clipped:r.reasonTruncated});
+		`,
+			);
+			await vi.waitFor(() => expect(executions).toHaveLength(2));
+			executions[1].fail(new Error("ordinary child failure"));
+			await vi.waitFor(() => expect(executions).toHaveLength(3));
+			expect(executions.map((e) => e.options.request.prompt)).toEqual(["good", "bad", "queued"]);
+			expect(executions[0].options.signal.aborted).toBe(false);
+			expect(executions[2].options.signal.aborted).toBe(false);
+			expect(JSON.parse(readFileSync(started.resultPath, "utf8")).status).toBe("running");
+			executions[2].complete("Q", 7);
+			executions[0].complete("G", 5);
+			await ready(harness, started.workflow.id);
+			const record: WorkflowRecord = JSON.parse(readFileSync(started.resultPath, "utf8"));
+			expect(record).toMatchObject({
+				outcome: "completed",
+				deliveryComplete: false,
+				usage: { totalTokens: 12 },
+				budget: { unknownTokens: 1, reservedTokens: 1 },
+				agents: [
+					{ status: "completed" },
+					{ status: "failed", requests: [{ status: "unknown" }] },
+					{ status: "completed" },
+				],
+			});
+			expect(record.result).toContain('["G",{"status":"rejected","ordinary":true,"clipped":false},"Q"]');
+			expect(record.resultRead).toBeUndefined();
+			expect((await call(harness, { action: "result", id: started.workflow.id })).usage?.totalTokens).toBe(12);
+			expect((await call(harness, { action: "result", id: started.workflow.id })).usage).toBeUndefined();
+		},
+	);
+
+	it.each([
+		["parallelSettled", "stop"],
+		["pipelineSettled", "stop"],
+		["parallelSettled", "budget"],
+		["pipelineSettled", "budget"],
+		["parallelSettled", "deadline"],
+		["pipelineSettled", "deadline"],
+	] as const)("%s cannot collect authoritative %s into script success", async (helper, reason) => {
+		const { harness, executions } = await setup({
+			limits: { concurrency: 1, maxTotalTokens: 10, timeoutSeconds: reason === "deadline" ? 1 : 60 },
+		});
+		const invoke =
+			helper === "parallelSettled"
+				? "parallelSettled(['pending','queued'])"
+				: "pipelineSettled(['pending','queued'], item => agent(item))";
+		const started = await launch(harness, `await ${invoke}; return 'AFTER_COLLECTOR';`);
+		await vi.waitFor(() => {
+			expect(executions).toHaveLength(1);
+			expect(JSON.parse(readFileSync(started.resultPath, "utf8")).agents).toHaveLength(2);
+		});
+		if (reason === "stop") await harness.session.prompt(`/workflow stop ${started.workflow.id}`);
+		else if (reason === "budget") executions[0].complete("overshoot", 20);
+		await ready(harness, started.workflow.id);
+		const record: WorkflowRecord = JSON.parse(readFileSync(started.resultPath, "utf8"));
+		expect(record.outcome).toBe(reason === "stop" ? "stopped" : "failed");
+		expect(record.deliveryComplete).toBe(false);
+		expect(record.result).not.toContain("AFTER_COLLECTOR");
+		expect(record.error).toContain(
+			reason === "stop" ? "Stopped by user" : reason === "budget" ? "token budget exhausted" : "deadline expired",
+		);
+		expect(executions).toHaveLength(1);
+		expect(executions[0].options.signal.aborted).toBe(true);
+		expect(record.agents[1].requests).toEqual([]);
+	});
+
+	it("settled collection cannot swallow the real bridge-call cap while a child is pending", async () => {
+		const { harness, executions } = await setup();
+		const started = await launch(
+			harness,
+			`
+			await parallelSettled([
+				() => agent('pending'),
+				async () => { for (let i=0; i<1024; i++) await checkpoint(); }
+			]);
+			return 'AFTER_BRIDGE_CAP';
+		`,
+		);
+		await ready(harness, started.workflow.id);
+		const record: WorkflowRecord = JSON.parse(readFileSync(started.resultPath, "utf8"));
+		expect(record).toMatchObject({ outcome: "failed", deliveryComplete: false });
+		expect(record.error).toContain("bridge call limit reached (1024)");
+		expect(record.result).not.toContain("AFTER_BRIDGE_CAP");
+		expect(executions).toHaveLength(1);
+		expect(executions[0].options.signal.aborted).toBe(true);
 	});
 
 	it("limits parallel children and supports ordered pipeline results and phases", async () => {

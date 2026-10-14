@@ -127,9 +127,12 @@ Supported subset:
   rejects; scripts may explicitly catch ordinary child failures. This differs
   from Claude's null-result behavior. There are no automatic child restarts.
 - `await parallel([()=>agent(...), ...])` runs functions (or prompt strings)
-  concurrently; host admission enforces the configured child limit.
+  concurrently; host admission enforces the configured child limit. It remains fail-fast.
 - `await pipeline(items, mapper, {concurrency?: 1..4})` maps items with bounded
-  concurrency and preserves input order. Serial stages use ordinary `await`.
+  concurrency and preserves input order. It remains fail-fast. Serial stages use ordinary `await`.
+- `await parallelSettled(tasks)` and `await pipelineSettled(items, mapper, {concurrency?: 1..4})`
+  explicitly collect promise observations instead of rejecting on an individual invocation's
+  failure. See the contract below; they do not classify business results or restart work.
 - `await phase(title, {maxTotalTokens?})`, `await log(message)` update local progress/logs.
   Optional phase/child token allocations narrow the configured workflow limit; they
   cannot raise it. Every phase has a distinct ID, including repeated titles. Children
@@ -137,6 +140,52 @@ Supported subset:
 - `await checkpoint()` waits if paused. Every new child and model request also
   passes a pause checkpoint.
 - `args` contains JSON launch input. Top-level `await` and `return` are supported.
+
+### Explicit failure collection
+
+Use settled helpers when independent work should finish despite an ordinary child
+failure. Each helper accepts at most **32 input positions**; `pipelineSettled` reuses
+pipeline's concurrency **1–4 (default 4)**. Manager child/request/phase limits still apply.
+The input length is captured before work: newly appended positions are not visited.
+Values are read at invocation time; a synchronous throw (including indexed access),
+rejected promise or failed child produces one row in input order:
+
+- `{status: "fulfilled", value}` observes a resolved invocation, not a verified task.
+- `{status: "rejected", reason, reasonTruncated}` observes a catchable rejection.
+  `reason` is untrusted `String(error)` text, capped at **2000 JavaScript characters**;
+  failed conversion uses `"Unprintable rejection"`. No raw error object, stack or cause
+  fields are added. `reasonTruncated` reports only this local clipping, not upstream
+  loss or whether a fallback preserved the original error. Omitted text is not archived
+  by the helper.
+
+```js
+await phase("Independent checks");
+const rows = await parallelSettled([
+  () => agent("Inspect the first area", { role: "scout" }),
+  () => agent("Inspect the second area", { role: "scout" }),
+]);
+return rows; // Inspect these observations and Workflow records before follow-on work.
+```
+
+The helpers catch each invocation, not just the outer group: pipeline workers keep
+claiming later positions after a rejection. They await all captured positions unless
+the host terminates the script. Stop, deadline, budget exhaustion and bridge limits
+remain authoritative; collection cannot turn them into normal rejection rows and a
+successful run. There is no automatic retry, replay, new permission or task acceptance.
+
+Rows are generic promise observations, **not a trusted ordinary/fatal classifier**.
+Other catchable errors, including metadata exceptions, can also be rejection rows.
+Error wording never grants cancellation or retry authority. One function may launch
+zero or several children; a rejected row does not necessarily identify an Agent record.
+Successful values use existing Codemode serialization: `undefined` fields may disappear,
+and cyclic values or BigInt can still fail the final script result. Values are not
+pre-serialized or validated as business schemas by these helpers.
+
+`outcome: completed` still describes script completion. A caught failed child keeps
+`deliveryComplete: false`; mapper-only rejections and locally clipped reasons do not
+redefine that existing flag. Review row statuses, child records and truncation flags
+rather than treating fulfilled rows or an archive as business success. Default
+`parallel`/`pipeline` behavior is unchanged, including synchronous fail-fast invocation.
 
 ### Captured model and per-stage effort
 
